@@ -53,6 +53,7 @@ class Args:
     eval_episodes:   int   = 10
     save_results:    bool  = False
     results_dir:     str   = "results"
+    run_tag:         str   = ""
     # DQN hyperparameters
     learning_rate:   float = 1e-4
     gamma:           float = 0.99
@@ -151,6 +152,10 @@ def run_dqn(args: Args):
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    # Disable cuDNN non-deterministic algorithms so GPU runs are reproducible.
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
     env  = gym.make(env_name)
     env.reset(seed=args.seed)
@@ -251,7 +256,7 @@ def run_dqn(args: Args):
     env.close()
 
     if args.save_results:
-        path = RunLogger.default_path("DQN", args.env, args.seed, args.results_dir)
+        path = RunLogger.default_path("DQN", args.env, args.seed, args.results_dir, args.run_tag)
         logger.save(path)
 
     print(f"\nDone. Best eval: {max(e['eval_return'] for e in logger.log):.2f}")

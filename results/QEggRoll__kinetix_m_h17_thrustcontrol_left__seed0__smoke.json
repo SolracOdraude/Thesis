@@ -1,0 +1,64 @@
+{
+  "method": "QEggRoll",
+  "env": "kinetix/m/h17_thrustcontrol_left",
+  "seed": 0,
+  "config": {
+    "suite": "kinetix",
+    "kinetix_name": "kinetix/m/h17_thrustcontrol_left",
+    "action_type": "continuous",
+    "obs_scale": 16,
+    "max_steps": 1000,
+    "pop_size": 64,
+    "rank": 4,
+    "sigma": 0.5,
+    "sigma_shift": 1,
+    "sigma_decay": 1.0,
+    "n_parallel_evaluations": 4,
+    "deterministic_policy": false,
+    "fast_fitness": false,
+    "hidden_dim": 256,
+    "noise_size_exp": 16
+  },
+  "log": [
+    {
+      "env_steps": 256000,
+      "wall_time": 46.32123565673828,
+      "eval_return": 0.22741935402154922,
+      "train_return": 0.17970876395702362,
+      "fitness_signal": 12.375,
+      "eval_std": 0.1
+    },
+    {
+      "env_steps": 512000,
+      "wall_time": 92.00988721847534,
+      "eval_return": 0.14546995633281767,
+      "train_return": 0.1460682451725006,
+      "fitness_signal": 12.125,
+      "eval_std": 0.14
+    },
+    {
+      "env_steps": 768000,
+      "wall_time": 136.71317505836487,
+      "eval_return": -0.7055300027132034,
+      "train_return": 0.18975359201431274,
+      "fitness_signal": 12.7188,
+      "eval_std": 1.0
+    },
+    {
+      "env_steps": 1024000,
+      "wall_time": 181.8059220314026,
+      "eval_return": -0.3376957178115845,
+      "train_return": 0.18815341591835022,
+      "fitness_signal": 12.5938,
+      "eval_std": 0.76
+    },
+    {
+      "env_steps": 1280000,
+      "wall_time": 226.32454347610474,
+      "eval_return": -1.2979477327317,
+      "train_return": 0.07651969790458679,
+      "fitness_signal": 13.5625,
+      "eval_std": 1.24
+    }
+  ]
+}

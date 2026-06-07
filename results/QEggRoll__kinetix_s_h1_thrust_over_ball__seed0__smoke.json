@@ -1,0 +1,64 @@
+{
+  "method": "QEggRoll",
+  "env": "kinetix/s/h1_thrust_over_ball",
+  "seed": 0,
+  "config": {
+    "suite": "kinetix",
+    "kinetix_name": "kinetix/s/h1_thrust_over_ball",
+    "action_type": "continuous",
+    "obs_scale": 16,
+    "max_steps": 1000,
+    "pop_size": 64,
+    "rank": 1,
+    "sigma": 0.5,
+    "sigma_shift": 1,
+    "sigma_decay": 0.9995,
+    "n_parallel_evaluations": 1,
+    "deterministic_policy": false,
+    "fast_fitness": false,
+    "hidden_dim": 256,
+    "noise_size_exp": 16
+  },
+  "log": [
+    {
+      "env_steps": 64000,
+      "wall_time": 37.145304918289185,
+      "eval_return": -4.253244042396545,
+      "train_return": -19.34937286376953,
+      "fitness_signal": 15.4688,
+      "eval_std": 0.32
+    },
+    {
+      "env_steps": 128000,
+      "wall_time": 74.24688243865967,
+      "eval_return": -2.00939529389143,
+      "train_return": -18.325611114501953,
+      "fitness_signal": 15.5938,
+      "eval_std": 1.78
+    },
+    {
+      "env_steps": 192000,
+      "wall_time": 111.77221274375916,
+      "eval_return": -2.4598023891448975,
+      "train_return": -17.341100692749023,
+      "fitness_signal": 15.4062,
+      "eval_std": 0.46
+    },
+    {
+      "env_steps": 256000,
+      "wall_time": 148.4310600757599,
+      "eval_return": -3.841623306274414,
+      "train_return": -15.96591567993164,
+      "fitness_signal": 15.4688,
+      "eval_std": 0.89
+    },
+    {
+      "env_steps": 320000,
+      "wall_time": 185.35626983642578,
+      "eval_return": -3.308406352996826,
+      "train_return": -13.375993728637695,
+      "fitness_signal": 15.4062,
+      "eval_std": 2.18
+    }
+  ]
+}

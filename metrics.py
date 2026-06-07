@@ -78,7 +78,7 @@ class RunLogger:
         }
         with open(path, "w") as f:
             json.dump(payload, f, indent=2)
-        print(f"  → saved to {path}")
+        print(f"  -> saved to {path}")
 
     @staticmethod
     def load(path: str) -> Dict:
@@ -86,6 +86,7 @@ class RunLogger:
             return json.load(f)
 
     @staticmethod
-    def default_path(method: str, env: str, seed: int, results_dir: str = "results") -> str:
+    def default_path(method: str, env: str, seed: int, results_dir: str = "results", tag: str = "") -> str:
         safe_env = env.replace("/", "_")
-        return os.path.join(results_dir, f"{method}__{safe_env}__seed{seed}.json")
+        suffix = f"__{tag}" if tag else ""
+        return os.path.join(results_dir, f"{method}__{safe_env}__seed{seed}{suffix}.json")

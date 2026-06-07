@@ -1,0 +1,48 @@
+{
+  "method": "DQN",
+  "env": "CartPole-v1",
+  "seed": 0,
+  "config": {
+    "env": "CartPole-v1",
+    "seed": 0,
+    "total_timesteps": 2000,
+    "log_every": 500,
+    "eval_episodes": 2,
+    "save_results": true,
+    "results_dir": "results",
+    "run_tag": "smoke",
+    "learning_rate": 0.0001,
+    "gamma": 0.99,
+    "buffer_size": 50000,
+    "batch_size": 128,
+    "target_update": 1000,
+    "eps_start": 1.0,
+    "eps_end": 0.05,
+    "eps_decay": 50000,
+    "min_replay": 5000,
+    "train_freq": 4
+  },
+  "log": [
+    {
+      "env_steps": 500,
+      "wall_time": 0.2189316749572754,
+      "eval_return": 8.5,
+      "train_return": null,
+      "extra_eps": 0.991
+    },
+    {
+      "env_steps": 1000,
+      "wall_time": 0.2455587387084961,
+      "eval_return": 8.5,
+      "train_return": null,
+      "extra_eps": 0.981
+    },
+    {
+      "env_steps": 1500,
+      "wall_time": 0.2788567543029785,
+      "eval_return": 8.5,
+      "train_return": null,
+      "extra_eps": 0.972
+    }
+  ]
+}

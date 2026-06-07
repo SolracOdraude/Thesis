@@ -12,7 +12,8 @@ Environments (paper Tables 3–16):
   navix   : DoorKey-8x8-v0, Dynamic-Obstacles-Random-6x6-v0, FourRooms-8x8-v0
 
 Install missing suites as needed:
-  pip install gymnax brax craftax jumanji navix kinetix
+  pip install gymnax brax craftax jumanji navix
+  pip install git+https://github.com/FLAIROx/Kinetix.git  # RL kinetix (not PyPI)
 
 Architectural differences from the paper's float EggRoll
 ---------------------------------------------------------
@@ -32,6 +33,14 @@ Usage
   python experiments.py --env brax/ant --num_epochs 500
   python experiments.py --env jumanji/Snake-v1 --seed 1
 """
+
+import os
+# RTX 40-series (Ada Lovelace) int8 GEMM bug: Triton int8 kernels produce 2x values.
+# Disabling Triton GEMM falls back to cuBLAS which handles int8 correctly.
+_xla = os.environ.get("XLA_FLAGS", "")
+if "--xla_gpu_enable_triton_gemm" not in _xla:
+    _xla += " --xla_gpu_enable_triton_gemm=false"
+os.environ["XLA_FLAGS"] = _xla.strip()
 
 import jax
 import jax.numpy as jnp
@@ -110,12 +119,14 @@ class Args:
     eval_episodes: int   = 5
     save_results:  bool  = False
     results_dir:   str   = "results"
+    run_tag:       str   = ""
     # Override hparams from the table (also used for ablation studies):
-    pop_size:      Optional[int]   = None
-    sigma_shift:   Optional[int]   = None
-    rank:          Optional[int]   = None
-    hidden_dim:    Optional[int]   = None   # ablation: network width
-    noise_size_exp: Optional[int]  = None   # ablation: BIG_RAND_MATRIX size
+    pop_size:               Optional[int]   = None
+    sigma_shift:            Optional[int]   = None
+    rank:                   Optional[int]   = None
+    n_parallel_evaluations: Optional[int]   = None
+    hidden_dim:             Optional[int]   = None   # ablation: network width
+    noise_size_exp:         Optional[int]   = None   # ablation: BIG_RAND_MATRIX size
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -265,7 +276,7 @@ def make_brax_rollout(env, cfg,
         init_state = env.reset(rng_key)
         (_, total_return, _), _ = jax.lax.scan(
             step_fn,
-            (init_state, jnp.array(0.0), jnp.array(False)),
+            (init_state, jnp.array(0.0), jnp.array(0.0)),
             None,
             length=max_steps,
         )
@@ -369,7 +380,7 @@ def make_navix_rollout(env, cfg,
             rng, act_rng = jax.random.split(rng)
             action = select_action_discrete(logits, act_rng, deterministic)
             next_timestep = env.step(timestep, action)
-            done = timestep.last()
+            done = timestep.is_done()
             total_return = total_return + next_timestep.reward * (1.0 - done.astype(jnp.float32))
             return (next_timestep, total_return, rng), None
 
@@ -470,15 +481,12 @@ def setup_environment(cfg, key, frozen_noiser_params, frozen_params, es_tree_key
 
     elif suite == "craftax":
         assert HAS_CRAFTAX, "pip install craftax"
-        import craftax.craftax.envs  # noqa
         from craftax.craftax.envs.craftax_symbolic_env import CraftaxSymbolicEnv
-        env_cls = getattr(
-            craftax.craftax.envs,
-            cfg["craftax_name"].replace("-", "_").replace(".", "_"),
-            None,
-        )
-        # Fall back to gymnax.make which craftax registers into
-        env, env_params = gymnax.make(cfg["craftax_name"])
+        try:
+            env, env_params = gymnax.make(cfg["craftax_name"])
+        except ValueError:
+            env = CraftaxSymbolicEnv()
+            env_params = env.default_params
 
         dummy_key = jax.random.key(0)
         obs, _ = env.reset(dummy_key, env_params)
@@ -496,7 +504,7 @@ def setup_environment(cfg, key, frozen_noiser_params, frozen_params, es_tree_key
         dummy_key = jax.random.key(0)
         _, init_ts = env.reset(dummy_key)
         obs_dim = int(np.prod(flatten_obs(init_ts.observation).shape))
-        act_spec = env.action_spec()
+        act_spec = env.action_spec
         act_dim = int(act_spec.num_values) if hasattr(act_spec, "num_values") \
                   else int(np.prod(act_spec.shape))
 
@@ -518,8 +526,23 @@ def setup_environment(cfg, key, frozen_noiser_params, frozen_params, es_tree_key
         eval_fn = lambda np_, p, rng: fn(np_, p, None, rng)
 
     elif suite == "kinetix":
-        assert HAS_KINETIX, "pip install kinetix"
-        env, env_params = kinetix.make(cfg["kinetix_name"])
+        assert HAS_KINETIX, "pip install git+https://github.com/FLAIROx/Kinetix.git"
+        from kinetix.environment import make_kinetix_env, ActionType, ObservationType
+        from kinetix.util import load_evaluation_levels
+
+        level_path = cfg["kinetix_name"].removeprefix("kinetix/")
+        levels, static_env_params = load_evaluation_levels([level_path])
+
+        def _kinetix_reset_fn(rng):
+            return jax.tree.map(lambda x: x[0], levels)
+
+        env = make_kinetix_env(
+            ActionType.CONTINUOUS,
+            ObservationType.SYMBOLIC_FLAT,
+            reset_fn=_kinetix_reset_fn,
+            static_env_params=static_env_params,
+        )
+        env_params = env.default_params
 
         dummy_key = jax.random.key(0)
         obs, _ = env.reset(dummy_key, env_params)
@@ -557,9 +580,10 @@ def run_experiment(args: Args):
             f"Unknown env {args.env!r}. Available: {list(EGGROLL_HPARAMS)}")
 
     cfg = dict(EGGROLL_HPARAMS[args.env])
-    if args.pop_size     is not None: cfg["pop_size"]    = args.pop_size
-    if args.sigma_shift  is not None: cfg["sigma_shift"] = args.sigma_shift
-    if args.rank         is not None: cfg["rank"]        = args.rank
+    if args.pop_size               is not None: cfg["pop_size"]               = args.pop_size
+    if args.sigma_shift            is not None: cfg["sigma_shift"]            = args.sigma_shift
+    if args.rank                   is not None: cfg["rank"]                   = args.rank
+    if args.n_parallel_evaluations is not None: cfg["n_parallel_evaluations"] = args.n_parallel_evaluations
 
     suite       = cfg["suite"]
     action_type = cfg["action_type"]
@@ -678,7 +702,15 @@ def run_experiment(args: Args):
 
     # ── Metrics setup ─────────────────────────────────────────────────────────
     run_cfg = {k: v for k, v in cfg.items() if not k.startswith("_")}
-    run_cfg.update(hidden_dim=hidden_dim, noise_size_exp=args.noise_size_exp or 28)
+    run_cfg.update(
+        hidden_dim=hidden_dim,
+        noise_size_exp=args.noise_size_exp or 28,
+        # Training schedule — stored so a JSON alone fully reproduces the run
+        seed=args.seed,
+        num_epochs=args.num_epochs,
+        log_every=args.log_every,
+        eval_episodes=args.eval_episodes,
+    )
     logger = RunLogger("QEggRoll", args.env, args.seed, run_cfg)
     # env_steps per epoch: N population members × K episodes × max_steps
     # (conservative count — jax.lax.scan runs max_steps regardless of early done)
@@ -724,7 +756,7 @@ def run_experiment(args: Args):
                              fit=f"{mean_fit:.3f}")
 
     if args.save_results:
-        path = RunLogger.default_path("QEggRoll", args.env, args.seed, args.results_dir)
+        path = RunLogger.default_path("QEggRoll", args.env, args.seed, args.results_dir, args.run_tag)
         logger.save(path)
 
     print(f"\nDone. Best eval return: {best_eval:.2f}")

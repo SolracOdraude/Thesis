@@ -1,303 +1,260 @@
 """
 ppo_baseline.py
 ===============
-Self-contained JAX/gymnax PPO matching the architecture used in the EGGROLL paper:
-  - 3-layer MLP, 256 hidden units, pqn = relu(layer_norm(x)) activation
-  - Generalised Advantage Estimation (GAE)
-  - Clipped surrogate objective with value-function and entropy terms
-  - Running observation normalisation
-  - Supports discrete and continuous (Gaussian) action spaces
+PPO baseline using Rejax — matches the paper's methodology exactly.
 
-The implementation is intentionally written in the same functional style as
-main.py (plain JAX pytrees + optax) so it integrates naturally with the rest
-of the codebase.  No Flax or Haiku dependency is required.
+Supports all 16 target environments via rejax.compat wrappers:
+  gymnax  : CartPole-v1, Pendulum-v1
+  brax    : brax/ant, brax/humanoid, brax/inverted_double_pendulum
+  craftax : craftax/Craftax-Classic-Symbolic-AutoReset-v1,
+            craftax/Craftax-Symbolic-AutoReset-v1
+  jumanji : jumanji/Game2048-v1, jumanji/Knapsack-v1, jumanji/Snake-v1
+  kinetix : kinetix/l/hard_pinball, kinetix/m/h17_thrustcontrol_left,
+            kinetix/s/h1_thrust_over_ball
+  navix   : navix/Navix-DoorKey-8x8-v0,
+            navix/Navix-Dynamic-Obstacles-Random-6x6-v0,
+            navix/Navix-FourRooms-v0
+
+Training calls algo.train(rng) directly; the inner jax.lax.scan is
+JIT-compiled by JAX automatically. The outer train() shell runs as Python
+so init_state does not execute under a JAX tracer (required for jumanji).
 
 Usage
 -----
   python ppo_baseline.py --env CartPole-v1
-  python ppo_baseline.py --env Pendulum-v1 --num_updates 800
-  python ppo_baseline.py --env CartPole-v1 --save_results
+  python ppo_baseline.py --env brax/ant --total_timesteps 5_000_000
+  python ppo_baseline.py --env jumanji/Snake-v1 --save_results
+  python ppo_baseline.py --env kinetix/l/hard_pinball --seed 1
 
-Hyperparameters are loaded from hparams.PPO_HPARAMS when the environment is
-listed there; otherwise sensible defaults are used.
+Hyperparameters are loaded from hparams.PPO_HPARAMS when available;
+CLI flags override individual fields.
 """
 
+import os
+# RTX 40-series int8 GEMM bug — same fix as experiments.py.
+_xla = os.environ.get("XLA_FLAGS", "")
+if "--xla_gpu_enable_triton_gemm" not in _xla:
+    _xla += " --xla_gpu_enable_triton_gemm=false"
+os.environ["XLA_FLAGS"] = _xla.strip()
+
+import time
+import numpy as np
 import jax
 import jax.numpy as jnp
-import numpy as np
-import optax
 import gymnax
+import rejax
+import rejax.compat
+from flax import linen as nn
+from rejax.networks import DiscretePolicy, GaussianPolicy, VNetwork
+from rejax.evaluate import evaluate as rejax_evaluate
 import tyro
-import tqdm
-import time
 from dataclasses import dataclass
-from functools import partial
-from typing import Optional, Tuple, NamedTuple
+from typing import Optional
 
 from hparams import PPO_HPARAMS, EGGROLL_HPARAMS
 from metrics import RunLogger
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────────────────────────────────────────
 
-HIDDEN_DIM = 256
-N_LAYERS   = 3
-
-
 @dataclass
 class Args:
-    env:          str   = "CartPole-v1"
-    seed:         int   = 0
-    num_updates:  int   = 1000      # number of PPO update iterations
-    log_every:    int   = 20
-    eval_episodes: int  = 10
-    save_results: bool  = False
-    results_dir:  str   = "results"
-    # PPO overrides (loaded from PPO_HPARAMS by default)
-    num_envs:          Optional[int]   = None
-    num_steps:         Optional[int]   = None
-    num_epochs:        Optional[int]   = None
-    num_minibatches:   Optional[int]   = None
-    learning_rate:     Optional[float] = None
-    gamma:             Optional[float] = None
-    gae_lambda:        Optional[float] = None
-    clip_eps:          Optional[float] = None
-    vf_coef:           Optional[float] = None
-    ent_coef:          Optional[float] = None
-    max_grad_norm:     Optional[float] = None
+    env:             str   = "CartPole-v1"
+    seed:            int   = 0
+    total_timesteps: Optional[int]   = None  # default derived from EGGROLL_HPARAMS
+    eval_freq:       Optional[int]   = None  # env steps between evals (default 10×batch)
+    save_results:    bool  = False
+    results_dir:     str   = "results"
+    run_tag:         str   = ""
+    # PPO hyperparameter overrides (defaults loaded from PPO_HPARAMS)
+    num_envs:        Optional[int]   = None
+    num_steps:       Optional[int]   = None
+    num_epochs:      Optional[int]   = None
+    num_minibatches: Optional[int]   = None
+    learning_rate:   Optional[float] = None
+    gamma:           Optional[float] = None
+    gae_lambda:      Optional[float] = None
+    clip_eps:        Optional[float] = None
+    vf_coef:         Optional[float] = None
+    ent_coef:        Optional[float] = None
+    max_grad_norm:   Optional[float] = None
+    normalize_obs:   Optional[bool]  = None
+    normalize_rew:   Optional[bool]  = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Activation
+# Environment creation helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def layer_norm(x, eps=1e-5):
-    mean = jnp.mean(x, axis=-1, keepdims=True)
-    var  = jnp.var(x,  axis=-1, keepdims=True)
-    return (x - mean) / jnp.sqrt(var + eps)
+def _episode_length(env_params) -> int:
+    """Extract episode length from env_params regardless of field name."""
+    for field in ("max_steps_in_episode", "max_timesteps", "max_steps"):
+        if hasattr(env_params, field):
+            v = getattr(env_params, field)
+            if v is not None:
+                return int(v)
+    return 1000
 
 
-def pqn(x):
-    """pqn = relu(layer_norm(x))  — the activation used throughout the EGGROLL paper."""
-    return jax.nn.relu(layer_norm(x))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Network (functional, plain JAX pytrees)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _fan_in_init(key, in_dim, out_dim, scale=1.0):
-    return jax.random.normal(key, (in_dim, out_dim)) * jnp.sqrt(scale / in_dim)
-
-
-def init_params(key, obs_dim: int, act_dim: int, continuous: bool):
-    keys = jax.random.split(key, N_LAYERS + 3)
-    dims = [obs_dim] + [HIDDEN_DIM] * N_LAYERS
-
-    shared = [
-        (_fan_in_init(keys[i], dims[i], dims[i+1], scale=2.0),
-         jnp.zeros(dims[i+1]))
-        for i in range(N_LAYERS)
-    ]
-    actor_W = _fan_in_init(keys[-3], HIDDEN_DIM, act_dim, scale=0.01)
-    actor_b = jnp.zeros(act_dim)
-    critic_W = _fan_in_init(keys[-2], HIDDEN_DIM, 1, scale=1.0)
-    critic_b = jnp.zeros(1)
-
-    params = {
-        "shared": shared,
-        "actor":  (actor_W, actor_b),
-        "critic": (critic_W, critic_b),
-    }
-    if continuous:
-        params["log_std"] = jnp.full((act_dim,), -0.5)
-    return params
-
-
-def _trunk(params, x):
-    for W, b in params["shared"]:
-        x = pqn(x @ W + b)
-    return x
-
-
-def actor_logits(params, obs):
-    """Returns logits (discrete) or action mean (continuous)."""
-    x = _trunk(params, obs)
-    W, b = params["actor"]
-    return x @ W + b
-
-
-def critic_value(params, obs):
-    x = _trunk(params, obs)
-    W, b = params["critic"]
-    return (x @ W + b).squeeze(-1)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Observation normalisation
-# ─────────────────────────────────────────────────────────────────────────────
-
-class ObsNorm(NamedTuple):
-    mean:  jnp.ndarray
-    var:   jnp.ndarray
-    count: int
-
-
-def init_obs_norm(obs_dim):
-    return ObsNorm(jnp.zeros(obs_dim), jnp.ones(obs_dim), 0)
-
-
-def update_obs_norm(norm: ObsNorm, obs_batch: jnp.ndarray) -> ObsNorm:
-    flat = obs_batch.reshape(-1, obs_batch.shape[-1])
-    n    = flat.shape[0]
-    bm   = flat.mean(0)
-    bv   = flat.var(0)
-    total = norm.count + n
-    delta = bm - norm.mean
-    new_mean = norm.mean + delta * n / total
-    new_var  = (norm.var * norm.count + bv * n +
-                delta ** 2 * norm.count * n / total) / total
-    return ObsNorm(new_mean, new_var, total)
-
-
-def normalize_obs(norm: ObsNorm, obs: jnp.ndarray, eps=1e-8) -> jnp.ndarray:
-    return (obs - norm.mean) / jnp.sqrt(norm.var + eps)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# GAE
-# ─────────────────────────────────────────────────────────────────────────────
-
-def compute_gae(rewards, values, dones, last_value, gamma, gae_lambda):
+class _DiscreteActionWrapper:
     """
-    rewards, values, dones : (T, N)
-    last_value             : (N,)
-    Returns advantages and returns, both (T, N).
+    Fixes rejax 0.1.2 jumanji bug: jumanji's DiscreteArray subclasses
+    BoundedArray, so rejax's convert_spec matches BoundedArray first and
+    returns Box instead of Discrete. This wrapper overrides action_space.
+
+    Uses object.__setattr__/__getattribute__ throughout to prevent infinite
+    recursion when deepcopy reconstructs the object before __init__ runs.
     """
-    def scan_fn(carry, inputs):
-        gae, next_val = carry
-        reward, val, done = inputs
-        delta = reward + gamma * next_val * (1.0 - done) - val
-        gae   = delta + gamma * gae_lambda * (1.0 - done) * gae
-        return (gae, val), gae
+    def __init__(self, env, n_actions: int):
+        object.__setattr__(self, '_env', env)
+        object.__setattr__(self, '_space',
+                           gymnax.environments.spaces.Discrete(num_categories=n_actions))
 
-    _, adv_reversed = jax.lax.scan(
-        scan_fn,
-        (jnp.zeros_like(last_value), last_value),
-        (rewards[::-1], values[::-1], dones[::-1]),
-    )
-    advantages = adv_reversed[::-1]
-    returns    = advantages + values
-    return advantages, returns
+    def __getattr__(self, name):
+        try:
+            env = object.__getattribute__(self, '_env')
+        except AttributeError:
+            raise AttributeError(f"'{type(self).__name__}' has no attribute '{name}'")
+        return getattr(env, name)
+
+    def action_space(self, params):
+        return object.__getattribute__(self, '_space')
+
+    def reset(self, key, params=None):
+        return object.__getattribute__(self, '_env').reset(key, params)
+
+    def step(self, key, state, action, params=None):
+        return object.__getattribute__(self, '_env').step(key, state, action, params)
+
+    def observation_space(self, params):
+        return object.__getattribute__(self, '_env').observation_space(params)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PPO loss
+# Environment creation
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _discrete_log_prob_entropy(params, obs, actions):
-    logits    = jax.vmap(partial(actor_logits, params))(obs)
-    log_probs = jax.nn.log_softmax(logits)
-    sel_lp    = log_probs[jnp.arange(len(actions)), actions]
-    probs     = jax.nn.softmax(logits)
-    entropy   = -jnp.sum(probs * log_probs, axis=-1).mean()
-    return sel_lp, entropy
+def make_env(env_name: str):
+    """
+    Return (env, env_params, max_steps_per_episode) for any supported suite.
+    All returned envs expose the gymnax interface:
+      env.reset(key, params) -> (obs, state)
+      env.step(key, state, action, params) -> (obs, state, reward, done, info)
+      env.action_space(params) -> gymnax Space
+    """
+    cfg = EGGROLL_HPARAMS.get(env_name, {})
+    suite = cfg.get("suite", "gymnax")
 
+    if suite == "gymnax":
+        env, env_params = gymnax.make(env_name)
+        return env, env_params, _episode_length(env_params)
 
-def _continuous_log_prob_entropy(params, obs, actions):
-    means   = jax.vmap(partial(actor_logits, params))(obs)
-    log_std = params["log_std"]
-    std     = jnp.exp(log_std)
-    log_p   = -0.5 * (((actions - means) / std) ** 2 + 2 * log_std
-                      + jnp.log(2 * jnp.pi)).sum(-1)
-    entropy = (0.5 * (1 + jnp.log(2 * jnp.pi)) + log_std).sum()
-    return log_p, entropy
+    elif suite in ("brax", "navix"):
+        env, env_params = rejax.compat.create(env_name)
+        return env, env_params, _episode_length(env_params)
 
+    elif suite == "jumanji":
+        import jumanji as _jumanji
+        from jumanji.specs import DiscreteArray as _JumanjiDiscrete
+        env, env_params = rejax.compat.create(env_name)
+        # Fix rejax 0.1.2: DiscreteArray subclasses BoundedArray, so convert_spec
+        # matches BoundedArray first and returns Box instead of Discrete.
+        raw_spec = _jumanji.make(cfg["jumanji_name"]).action_spec
+        if isinstance(raw_spec, _JumanjiDiscrete):
+            env = _DiscreteActionWrapper(env, int(raw_spec.num_values))
+        return env, env_params, _episode_length(env_params)
 
-def ppo_loss(params, batch, clip_eps, vf_coef, ent_coef, continuous):
-    obs, actions, old_log_probs, advantages, returns, old_values = batch
+    elif suite == "craftax":
+        from craftax.craftax.envs.craftax_symbolic_env import CraftaxSymbolicEnv
+        try:
+            env, env_params = gymnax.make(cfg["craftax_name"])
+        except ValueError:
+            env = CraftaxSymbolicEnv()
+            env_params = env.default_params
+        # Don't replace max_steps_in_episode — craftax EnvParams uses its own
+        # field names. The QEggRoll cfg["max_steps"] is a training rollout param,
+        # not an env property PPO needs to override.
+        return env, env_params, _episode_length(env_params)
 
-    # Normalise advantages within the minibatch
-    adv = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    elif suite == "kinetix":
+        from kinetix.environment import make_kinetix_env, ActionType, ObservationType
+        from kinetix.util import load_evaluation_levels
+        level_path = cfg["kinetix_name"].removeprefix("kinetix/")
+        levels, static_env_params = load_evaluation_levels([level_path])
+        def _reset_fn(rng):
+            return jax.tree.map(lambda x: x[0], levels)
+        env = make_kinetix_env(
+            ActionType.CONTINUOUS,
+            ObservationType.SYMBOLIC_FLAT,
+            reset_fn=_reset_fn,
+            static_env_params=static_env_params,
+        )
+        env_params = env.default_params
+        max_steps = int(env_params.max_timesteps)
+        return env, env_params, max_steps
 
-    if continuous:
-        new_log_probs, entropy = _continuous_log_prob_entropy(params, obs, actions)
     else:
-        new_log_probs, entropy = _discrete_log_prob_entropy(params, obs, actions)
-
-    # Clipped actor loss
-    ratio  = jnp.exp(new_log_probs - old_log_probs)
-    pg     = -jnp.minimum(ratio * adv,
-                           jnp.clip(ratio, 1 - clip_eps, 1 + clip_eps) * adv).mean()
-
-    # Clipped critic loss
-    new_vals    = jax.vmap(partial(critic_value, params))(obs)
-    v_clipped   = old_values + jnp.clip(new_vals - old_values, -clip_eps, clip_eps)
-    vf          = jnp.maximum((new_vals - returns) ** 2,
-                               (v_clipped - returns) ** 2).mean()
-
-    loss = pg + vf_coef * vf - ent_coef * entropy
-    return loss, (pg, vf, entropy)
+        raise ValueError(f"Unsupported suite for PPO: {suite!r}. "
+                         f"Env={env_name!r}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Rollout
+# Build rejax.PPO
 # ─────────────────────────────────────────────────────────────────────────────
 
-def make_rollout_fn(env, env_params, num_steps, num_envs, continuous):
-    v_reset = jax.vmap(env.reset, in_axes=(0, None))
-    v_step  = jax.vmap(env.step,  in_axes=(0, 0, 0, None))
+def _build_ppo(env, env_params, hp: dict, total_timesteps: int,
+               eval_freq: int, max_steps: int) -> rejax.PPO:
+    """
+    Construct a rejax.PPO instance directly without using PPO.create(), so
+    we can supply a custom eval_callback that handles env_params that lack
+    max_steps_in_episode (e.g. kinetix).
+    """
+    action_space = env.action_space(env_params)
+    discrete = isinstance(action_space, gymnax.environments.spaces.Discrete)
 
-    def rollout(params, obs_norm, carry, rng):
-        """
-        carry : (obs, state, done)  — gym carry across epochs
-        Returns updated carry and stacked transitions.
-        """
-        obs0, state0, done0 = carry
+    hidden = tuple([hp.get("layer_size", 256)] * hp.get("n_layers", 3))
+    agent_kwargs = {"activation": nn.tanh, "hidden_layer_sizes": hidden}
 
-        def step_fn(carry, _):
-            obs, state, done, rng = carry
-            norm_obs = normalize_obs(obs_norm, obs)
+    if discrete:
+        actor = DiscretePolicy(int(action_space.n), **agent_kwargs)
+    else:
+        actor = GaussianPolicy(
+            int(np.prod(action_space.shape)),
+            (action_space.low, action_space.high),
+            **agent_kwargs,
+        )
+    critic = VNetwork(**agent_kwargs)
 
-            logits = jax.vmap(partial(actor_logits, params))(norm_obs)
-            vals   = jax.vmap(partial(critic_value, params))(norm_obs)
+    def eval_callback(algo, ts, rng):
+        act = algo.make_act(ts)
+        return rejax_evaluate(act, rng, env, env_params, 128, max_steps)
 
-            rng, a_rng, s_rng = jax.random.split(rng, 3)
-            a_rngs = jax.random.split(a_rng, num_envs)
-
-            if continuous:
-                std     = jnp.exp(params["log_std"])
-                actions = logits + std * jax.random.normal(a_rng, logits.shape)
-                std_bc  = jnp.broadcast_to(std, logits.shape)
-                log_ps  = -0.5 * (((actions - logits) / std_bc) ** 2
-                                  + 2 * jnp.log(std_bc)
-                                  + jnp.log(2 * jnp.pi)).sum(-1)
-            else:
-                actions = jax.vmap(
-                    lambda l, r: jax.random.categorical(r, l)
-                )(logits, a_rngs)
-                lp_all = jax.nn.log_softmax(logits)
-                log_ps = lp_all[jnp.arange(num_envs), actions]
-
-            s_rngs = jax.random.split(s_rng, num_envs)
-            next_obs, next_state, reward, next_done, _ = v_step(
-                s_rngs, state, actions, env_params)
-
-            transition = (obs, actions, log_ps, reward, vals, done)
-            return (next_obs, next_state, next_done, rng), transition
-
-        (obs_T, state_T, done_T, rng), transitions = jax.lax.scan(
-            step_fn, (obs0, state0, done0, rng), None, length=num_steps)
-
-        # Bootstrap value for the last observation
-        last_val = jax.vmap(partial(critic_value, params))(
-            normalize_obs(obs_norm, obs_T))
-        last_val = jnp.where(done_T, jnp.zeros_like(last_val), last_val)
-
-        return (obs_T, state_T, done_T), transitions, last_val
-
-    return rollout
+    return rejax.PPO(
+        env=env,
+        env_params=env_params,
+        eval_callback=eval_callback,
+        eval_freq=eval_freq,
+        skip_initial_evaluation=hp.get("skip_initial_eval", False),
+        total_timesteps=total_timesteps,
+        learning_rate=hp["learning_rate"],
+        gamma=hp["gamma"],
+        max_grad_norm=hp["max_grad_norm"],
+        normalize_rewards=hp.get("normalize_rew", False),
+        reward_normalization_discount=hp.get("rew_norm_discount", 0.99),
+        normalize_observations=hp.get("normalize_obs", True),
+        num_envs=hp["num_envs"],
+        num_steps=hp["num_steps"],
+        num_minibatches=hp["num_minibatches"],
+        actor=actor,
+        critic=critic,
+        num_epochs=hp["num_epochs"],
+        gae_lambda=hp["gae_lambda"],
+        clip_eps=hp["clip_eps"],
+        vf_coef=hp["vf_coef"],
+        ent_coef=hp["ent_coef"],
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -305,144 +262,113 @@ def make_rollout_fn(env, env_params, num_steps, num_envs, continuous):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_ppo(args: Args):
-    # ── Load hyperparameters ──────────────────────────────────────────────────
-    hp = dict(PPO_HPARAMS.get(args.env, {}))
-    cfg = {
-        "num_envs":        args.num_envs        or hp.get("num_envs",        64),
-        "num_steps":       args.num_steps        or hp.get("num_steps",       128),
-        "num_epochs":      args.num_epochs       or hp.get("num_epochs",      4),
-        "num_minibatches": args.num_minibatches  or hp.get("num_minibatches", 32),
-        "learning_rate":   args.learning_rate    or hp.get("learning_rate",   3e-4),
-        "gamma":           args.gamma            or hp.get("gamma",           0.99),
-        "gae_lambda":      args.gae_lambda       or hp.get("gae_lambda",      0.95),
-        "clip_eps":        args.clip_eps         or hp.get("clip_eps",        0.2),
-        "vf_coef":         args.vf_coef          or hp.get("vf_coef",         0.5),
-        "ent_coef":        args.ent_coef         or hp.get("ent_coef",        0.01),
-        "max_grad_norm":   args.max_grad_norm    or hp.get("max_grad_norm",   0.5),
+    # ── Hyperparameters ────────────────────────────────────────────────────────
+    defaults = {
+        "num_envs": 64, "num_steps": 128, "num_epochs": 4,
+        "num_minibatches": 32, "learning_rate": 3e-4, "gamma": 0.99,
+        "gae_lambda": 0.95, "clip_eps": 0.2, "vf_coef": 0.5, "ent_coef": 0.01,
+        "max_grad_norm": 0.5, "normalize_obs": True, "normalize_rew": False,
+        "rew_norm_discount": 0.99, "skip_initial_eval": False,
+        "layer_size": 256, "n_layers": 3,
     }
+    hp = {**defaults, **PPO_HPARAMS.get(args.env, {})}
 
-    # ── Environment ───────────────────────────────────────────────────────────
-    env_cfg = EGGROLL_HPARAMS.get(args.env, {})
-    env, env_params = gymnax.make(args.env)
-    if env_cfg.get("max_steps"):
-        env_params = env_params.replace(max_steps_in_episode=env_cfg["max_steps"])
-    continuous = env_cfg.get("action_type", "discrete") == "continuous"
+    # CLI overrides
+    for k in ("num_envs", "num_steps", "num_epochs", "num_minibatches",
+              "learning_rate", "gamma", "gae_lambda", "clip_eps",
+              "vf_coef", "ent_coef", "max_grad_norm", "normalize_obs",
+              "normalize_rew"):
+        v = getattr(args, k, None)
+        if v is not None:
+            hp[k] = v
 
-    key = jax.random.key(args.seed)
-    reset_keys = jax.random.split(key, cfg["num_envs"])
-    obs0, state0 = jax.vmap(env.reset, in_axes=(0, None))(reset_keys, env_params)
-    obs_dim = int(np.prod(obs0.shape[1:]))
-    act_dim = (int(np.prod(env.action_space(env_params).shape))
-               if continuous
-               else int(env.action_space(env_params).n))
+    # ── Environment ────────────────────────────────────────────────────────────
+    env, env_params, max_steps = make_env(args.env)
 
-    print(f"\nPPO | {args.env}  obs_dim={obs_dim}  act_dim={act_dim}"
-          f"  continuous={continuous}")
-    print(f"  num_envs={cfg['num_envs']}  num_steps={cfg['num_steps']}"
-          f"  num_minibatches={cfg['num_minibatches']}  num_epochs={cfg['num_epochs']}")
+    # ── Schedule ───────────────────────────────────────────────────────────────
+    batch_size = hp["num_envs"] * hp["num_steps"]
 
-    # ── Init ──────────────────────────────────────────────────────────────────
-    key, p_key = jax.random.split(key)
-    params   = init_params(p_key, obs_dim, act_dim, continuous)
-    obs_norm = init_obs_norm(obs_dim)
+    # total_timesteps: CLI > default derived from QEggRoll epochs in EGGROLL_HPARAMS
+    eggroll_cfg = EGGROLL_HPARAMS.get(args.env, {})
+    default_total = eggroll_cfg.get("num_epochs", 500) * batch_size
+    total_timesteps = args.total_timesteps or default_total
 
-    optimizer  = optax.chain(
-        optax.clip_by_global_norm(cfg["max_grad_norm"]),
-        optax.adam(cfg["learning_rate"]),
-    )
-    opt_state = optimizer.init(params)
+    # eval_freq: CLI > 10 × batch (logs ~100 checkpoints over the run)
+    eval_freq = args.eval_freq or (10 * batch_size)
 
-    rollout_fn = make_rollout_fn(
-        env, env_params, cfg["num_steps"], cfg["num_envs"], continuous)
+    # ── Info print ─────────────────────────────────────────────────────────────
+    action_space = env.action_space(env_params)
+    discrete = isinstance(action_space, gymnax.environments.spaces.Discrete)
+    try:
+        obs_space_shape = env.observation_space(env_params).shape
+    except Exception:
+        obs, _ = env.reset(jax.random.key(0), env_params)
+        obs_space_shape = obs.shape
+    obs_dim = int(np.prod(obs_space_shape))
+    act_dim = int(action_space.n) if discrete else int(np.prod(action_space.shape))
 
-    # ── JIT-compiled update step ───────────────────────────────────────────────
-    loss_fn = partial(ppo_loss,
-                      clip_eps=cfg["clip_eps"], vf_coef=cfg["vf_coef"],
-                      ent_coef=cfg["ent_coef"], continuous=continuous)
+    print(f"\nPPO (Rejax) | {args.env}")
+    print(f"  obs_dim={obs_dim}  act_dim={act_dim}  discrete={discrete}")
+    print(f"  num_envs={hp['num_envs']}  num_steps={hp['num_steps']}"
+          f"  num_epochs={hp['num_epochs']}  num_minibatches={hp['num_minibatches']}")
+    print(f"  total_timesteps={total_timesteps:,}  eval_freq={eval_freq:,}")
+    print(f"  lr={hp['learning_rate']}  gamma={hp['gamma']}"
+          f"  gae_lambda={hp['gae_lambda']}  clip_eps={hp['clip_eps']}")
+    print("Compiling...")
 
-    @jax.jit
-    def update(params, opt_state, batch):
-        (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, batch)
-        updates, opt_state = optimizer.update(grads, opt_state, params)
-        return optax.apply_updates(params, updates), opt_state, loss
+    # ── Build algo and train ───────────────────────────────────────────────────
+    algo = _build_ppo(env, env_params, hp, total_timesteps, eval_freq, max_steps)
+    rng = jax.random.key(args.seed)
 
-    @jax.jit
-    def eval_episode(params, obs_norm, rng_key):
-        def step(carry, _):
-            obs, state, done, total, rng = carry
-            norm_obs = normalize_obs(obs_norm, obs)
-            logits = actor_logits(params, norm_obs)
-            action = jnp.argmax(logits) if not continuous else logits
-            rng, s_rng = jax.random.split(rng)
-            next_obs, next_state, reward, next_done, _ = env.step(
-                s_rng, state, action, env_params)
-            total = total + reward * (1.0 - done.astype(jnp.float32))
-            return (next_obs, next_state, next_done, total, rng), None
-        rng_r, rng_e = jax.random.split(rng_key)
-        obs_e, state_e = env.reset(rng_r, env_params)
-        (_, _, _, total, _), _ = jax.lax.scan(
-            step, (obs_e, state_e, jnp.array(False), jnp.array(0.0), rng_e),
-            None, length=env_params.max_steps_in_episode)
-        return total
+    t0 = time.time()
+    ts, (eval_lengths, eval_returns) = algo.train(rng)
+    jax.block_until_ready(eval_returns)
+    wall_total = time.time() - t0
 
-    # ── Training loop ─────────────────────────────────────────────────────────
-    logger = RunLogger("PPO", args.env, args.seed, cfg)
-    logger.reset_clock()
+    # ── Convert evaluation arrays to RunLogger entries ─────────────────────────
+    # eval_returns: (num_evals, 128) — 128 parallel seeds per checkpoint
+    # If skip_initial_evaluation=False, index 0 is at step 0 (before any training).
+    num_evals = eval_returns.shape[0]
+    skip = hp.get("skip_initial_eval", False)
+    if skip:
+        steps_at = [eval_freq * (i + 1) for i in range(num_evals)]
+    else:
+        steps_at = [0] + [eval_freq * i for i in range(1, num_evals)]
 
-    B        = cfg["num_envs"] * cfg["num_steps"]   # batch size
-    M        = cfg["num_minibatches"]
-    mb_size  = B // M
-    carry    = (obs0, state0, jnp.zeros(cfg["num_envs"], dtype=bool))
-    cum_steps = 0
+    hp_saved = {
+        **hp,
+        "seed": args.seed,
+        "total_timesteps": total_timesteps,
+        "eval_freq": eval_freq,
+        "max_steps_per_episode": max_steps,
+    }
+    logger = RunLogger("PPO", args.env, args.seed, hp_saved)
+    returns_np = np.array(eval_returns)
+    for i in range(num_evals):
+        frac = steps_at[i] / max(steps_at[-1], 1)
+        logger.log.append({
+            "env_steps":       int(steps_at[i]),
+            "wall_time":       wall_total * frac,
+            "eval_return":     float(returns_np[i].mean()),
+            "eval_return_std": float(returns_np[i].std()),
+            "train_return":    None,
+        })
 
-    for update_i in tqdm.trange(args.num_updates):
-        key, r_key, e_key = jax.random.split(key, 3)
-
-        # Collect rollout
-        carry, (obs_t, act_t, lp_t, rew_t, val_t, done_t), last_val = \
-            rollout_fn(params, obs_norm, carry, r_key)
-
-        # Update obs normalisation
-        obs_norm = update_obs_norm(obs_norm, obs_t)
-
-        # GAE
-        adv_t, ret_t = compute_gae(
-            rew_t, val_t, done_t, last_val,
-            cfg["gamma"], cfg["gae_lambda"])
-
-        # Flatten (T*N,)
-        def flat(x): return x.reshape(B, *x.shape[2:])
-        batch_flat = tuple(map(flat, (obs_t, act_t, lp_t, adv_t, ret_t, val_t)))
-
-        # PPO epochs with random minibatches
-        for _ in range(cfg["num_epochs"]):
-            key, shuf_key = jax.random.split(key)
-            perm = jax.random.permutation(shuf_key, B)
-            for mb_i in range(M):
-                idx = perm[mb_i * mb_size : (mb_i + 1) * mb_size]
-                mb  = tuple(x[idx] for x in batch_flat)
-                params, opt_state, _ = update(params, opt_state, mb)
-
-        cum_steps += B
-
-        # Logging
-        if update_i % args.log_every == 0 or update_i == args.num_updates - 1:
-            eval_rngs = jax.random.split(e_key, args.eval_episodes)
-            eval_rets = np.array([
-                float(eval_episode(params, obs_norm, r)) for r in eval_rngs])
-            mean_eval  = eval_rets.mean()
-            mean_train = float(rew_t.sum(0).mean())
-
-            logger.record(cum_steps, mean_eval, mean_train)
-            logger.print_row(update_i, cum_steps, mean_eval, mean_train,
-                             std=f"{eval_rets.std():.1f}")
+    # ── Summary ────────────────────────────────────────────────────────────────
+    means = returns_np.mean(axis=1)
+    print(f"\n  wall={wall_total:.1f}s  checkpoints={num_evals}"
+          f"  best={means.max():.2f}  final={means[-1]:.2f}")
+    stride = max(1, num_evals // 8)
+    for i in range(0, num_evals, stride):
+        print(f"  step {steps_at[i]:>12,}  eval={means[i]:.2f}"
+              f"  std={returns_np[i].std():.2f}")
 
     if args.save_results:
-        path = RunLogger.default_path("PPO", args.env, args.seed, args.results_dir)
+        path = RunLogger.default_path("PPO", args.env, args.seed,
+                                      args.results_dir, args.run_tag)
         logger.save(path)
 
-    print(f"\nDone. Best eval: {max(e['eval_return'] for e in logger.log):.2f}")
-    return params
+    return ts
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -1,0 +1,65 @@
+{
+  "method": "QEggRoll",
+  "env": "brax/inverted_double_pendulum",
+  "seed": 0,
+  "config": {
+    "suite": "brax",
+    "brax_name": "inverted_double_pendulum",
+    "action_type": "continuous",
+    "action_dim": 1,
+    "obs_scale": 16,
+    "max_steps": 1000,
+    "pop_size": 64,
+    "rank": 2,
+    "sigma": 0.5,
+    "sigma_shift": 1,
+    "sigma_decay": 0.995,
+    "n_parallel_evaluations": 1,
+    "deterministic_policy": true,
+    "fast_fitness": false,
+    "hidden_dim": 256,
+    "noise_size_exp": 16
+  },
+  "log": [
+    {
+      "env_steps": 64000,
+      "wall_time": 113.39185857772827,
+      "eval_return": 1972.985595703125,
+      "train_return": NaN,
+      "fitness_signal": 12.6875,
+      "eval_std": 5.18
+    },
+    {
+      "env_steps": 128000,
+      "wall_time": 233.25433087348938,
+      "eval_return": 2000.5413818359375,
+      "train_return": -143.3917236328125,
+      "fitness_signal": 10.9688,
+      "eval_std": 14.61
+    },
+    {
+      "env_steps": 192000,
+      "wall_time": 352.2921760082245,
+      "eval_return": 2007.849609375,
+      "train_return": -116.09831237792969,
+      "fitness_signal": 12.25,
+      "eval_std": 4.29
+    },
+    {
+      "env_steps": 256000,
+      "wall_time": 476.7754921913147,
+      "eval_return": 1968.178955078125,
+      "train_return": 297.7689514160156,
+      "fitness_signal": 10.4688,
+      "eval_std": 17.98
+    },
+    {
+      "env_steps": 320000,
+      "wall_time": 599.5344140529633,
+      "eval_return": 1995.07666015625,
+      "train_return": NaN,
+      "fitness_signal": 12.875,
+      "eval_std": 8.78
+    }
+  ]
+}
