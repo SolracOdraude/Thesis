@@ -755,9 +755,10 @@ def run_experiment(args: Args):
             logger.print_row(epoch, cum_steps, mean_eval, mean_train,
                              fit=f"{mean_fit:.3f}")
 
-    if args.save_results:
-        path = RunLogger.default_path("QEggRoll", args.env, args.seed, args.results_dir, args.run_tag)
-        logger.save(path)
+            # Save after every checkpoint so an OOM kill doesn't lose all data.
+            if args.save_results:
+                path = RunLogger.default_path("QEggRoll", args.env, args.seed, args.results_dir, args.run_tag)
+                logger.save(path)
 
     print(f"\nDone. Best eval return: {best_eval:.2f}")
     return params, noiser_params

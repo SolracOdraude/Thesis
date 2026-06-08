@@ -354,30 +354,22 @@ def suite_thesis() -> List[RunSpec]:
         flags = {"total_timesteps": total_timesteps} if total_timesteps else {}
         return [RunSpec("PPO", env, s, tag=tag, flags=flags) for s in range(seeds)]
 
-    def dqn(env, seeds, total_timesteps):
-        return [RunSpec("DQN", env, s, tag=tag,
-                        flags={"total_timesteps": total_timesteps, "log_every": 10_000})
-                for s in range(seeds)]
-
-    # ── gymnax: CartPole — three-way comparison ───────────────────────────────
+    # ── gymnax: CartPole ──────────────────────────────────────────────────────
     runs += egg("CartPole-v1",  3, pop=512, epochs=1000)
     runs += ppo("CartPole-v1",  3, total_timesteps=2_000_000)
-    runs += dqn("CartPole-v1",  3, total_timesteps=500_000)
 
     # ── gymnax: Pendulum — continuous actions ─────────────────────────────────
     runs += egg("Pendulum-v1",  3, pop=512, epochs=800)
     runs += ppo("Pendulum-v1",  3, total_timesteps=4_000_000)
 
-    # ── brax: inverted_double_pendulum (3 seeds), ant (2 seeds) ───────────────
-    runs += egg("brax/inverted_double_pendulum", 3, pop=512, epochs=500)
-    runs += ppo("brax/inverted_double_pendulum", 3, total_timesteps=4_000_000)
+    # brax excluded: physics simulation is memory-bandwidth bound and OOMs
+    # the RTX 4060 Ti (8 GB VRAM) under JAX's vmapped rollout.
+    # Brax results will be sourced from the paper's L40S runs in the thesis.
 
-    runs += egg("brax/ant",  2, pop=256, epochs=300)
-    runs += ppo("brax/ant",  2, total_timesteps=5_000_000)
-
-    # ── craftax Classic — flagship task; reduced params for budget ────────────
+    # ── craftax Classic — OOM ceiling on RTX 4060 Ti is ~epoch 100 at pop=128;
+    # use 60 epochs so there is clear headroom, and log_every=10 for denser curves.
     CRAFTAX = "craftax/Craftax-Classic-Symbolic-AutoReset-v1"
-    runs += egg(CRAFTAX, 2, pop=128, epochs=150, n_parallel_evaluations=1)
+    runs += egg(CRAFTAX, 2, pop=128, epochs=60, n_parallel_evaluations=1, log_every=10)
     runs += ppo(CRAFTAX, 2, total_timesteps=2_000_000)
 
     # ── jumanji Snake — combinatorial sequential task ─────────────────────────
