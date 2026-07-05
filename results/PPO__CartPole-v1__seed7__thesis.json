@@ -1,0 +1,87 @@
+{
+  "method": "PPO",
+  "env": "CartPole-v1",
+  "seed": 7,
+  "config": {
+    "num_envs": 256,
+    "num_steps": 128,
+    "num_epochs": 4,
+    "num_minibatches": 32,
+    "learning_rate": 0.0003,
+    "gamma": 0.995,
+    "gae_lambda": 0.9,
+    "clip_eps": 0.2,
+    "vf_coef": 0.5,
+    "ent_coef": 0.0001,
+    "max_grad_norm": 0.5,
+    "normalize_obs": true,
+    "normalize_rew": false,
+    "rew_norm_discount": 0.99,
+    "skip_initial_eval": false,
+    "layer_size": 256,
+    "n_layers": 3,
+    "activation": "pqn",
+    "seed": 7,
+    "total_timesteps": 2000000,
+    "eval_freq": 327680,
+    "max_steps_per_episode": 500
+  },
+  "log": [
+    {
+      "env_steps": 0,
+      "wall_time": 0.0,
+      "eval_return": 27.8671875,
+      "eval_return_std": 17.386852264404297,
+      "train_return": null
+    },
+    {
+      "env_steps": 327680,
+      "wall_time": 2.095980780465262,
+      "eval_return": 257.3515625,
+      "eval_return_std": 28.29106330871582,
+      "train_return": null
+    },
+    {
+      "env_steps": 655360,
+      "wall_time": 4.191961560930524,
+      "eval_return": 292.125,
+      "eval_return_std": 38.10245132446289,
+      "train_return": null
+    },
+    {
+      "env_steps": 983040,
+      "wall_time": 6.2879423413957864,
+      "eval_return": 412.15625,
+      "eval_return_std": 112.08740997314453,
+      "train_return": null
+    },
+    {
+      "env_steps": 1310720,
+      "wall_time": 8.383923121861049,
+      "eval_return": 484.5703125,
+      "eval_return_std": 51.13381576538086,
+      "train_return": null
+    },
+    {
+      "env_steps": 1638400,
+      "wall_time": 10.479903902326312,
+      "eval_return": 495.0078125,
+      "eval_return_std": 27.373428344726562,
+      "train_return": null
+    },
+    {
+      "env_steps": 1966080,
+      "wall_time": 12.575884682791573,
+      "eval_return": 500.0,
+      "eval_return_std": 0.0,
+      "train_return": null
+    },
+    {
+      "env_steps": 2293760,
+      "wall_time": 14.671865463256836,
+      "eval_return": 499.8046875,
+      "eval_return_std": 2.2010600566864014,
+      "train_return": null
+    }
+  ]
+}

@@ -100,17 +100,27 @@ def _episode_length(env_params) -> int:
 
 class _DiscreteActionWrapper:
     """
-    Fixes rejax 0.1.2 jumanji bug: jumanji's DiscreteArray subclasses
-    BoundedArray, so rejax's convert_spec matches BoundedArray first and
-    returns Box instead of Discrete. This wrapper overrides action_space.
+    Fixes two rejax 0.1.2 jumanji bugs:
+    1. DiscreteArray subclasses BoundedArray, so convert_spec returns Box
+       instead of Discrete — fixed by overriding action_space().
+    2. observation_space().shape contains traced JAX floats instead of
+       concrete ints; rejax's initialize_network_params uses that shape
+       directly in jnp.empty([1, *shape]) and crashes — fixed by storing
+       a gymnax Box built from a concrete reset() observation.
 
     Uses object.__setattr__/__getattribute__ throughout to prevent infinite
     recursion when deepcopy reconstructs the object before __init__ runs.
     """
-    def __init__(self, env, n_actions: int):
+    def __init__(self, env, n_actions: int, obs_shape: tuple):
         object.__setattr__(self, '_env', env)
         object.__setattr__(self, '_space',
                            gymnax.environments.spaces.Discrete(num_categories=n_actions))
+        # Build a Box whose .shape contains plain Python ints so rejax can
+        # pass it straight to jnp.empty without hitting canonicalize_shape.
+        object.__setattr__(self, '_obs_box',
+                           gymnax.environments.spaces.Box(
+                               low=-np.inf, high=np.inf,
+                               shape=obs_shape, dtype=np.float32))
 
     def __getattr__(self, name):
         try:
@@ -122,14 +132,14 @@ class _DiscreteActionWrapper:
     def action_space(self, params):
         return object.__getattribute__(self, '_space')
 
+    def observation_space(self, params):
+        return object.__getattribute__(self, '_obs_box')
+
     def reset(self, key, params=None):
         return object.__getattribute__(self, '_env').reset(key, params)
 
     def step(self, key, state, action, params=None):
         return object.__getattribute__(self, '_env').step(key, state, action, params)
-
-    def observation_space(self, params):
-        return object.__getattribute__(self, '_env').observation_space(params)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -159,11 +169,14 @@ def make_env(env_name: str):
         import jumanji as _jumanji
         from jumanji.specs import DiscreteArray as _JumanjiDiscrete
         env, env_params = rejax.compat.create(env_name)
-        # Fix rejax 0.1.2: DiscreteArray subclasses BoundedArray, so convert_spec
-        # matches BoundedArray first and returns Box instead of Discrete.
+        # Get a concrete obs shape before wrapping — the compat env's
+        # observation_space().shape contains traced JAX floats, so we
+        # derive the shape from an actual reset() call instead.
+        _obs, _ = env.reset(jax.random.key(0), env_params)
+        obs_shape = tuple(int(s) for s in _obs.shape)
         raw_spec = _jumanji.make(cfg["jumanji_name"]).action_spec
         if isinstance(raw_spec, _JumanjiDiscrete):
-            env = _DiscreteActionWrapper(env, int(raw_spec.num_values))
+            env = _DiscreteActionWrapper(env, int(raw_spec.num_values), obs_shape)
         return env, env_params, _episode_length(env_params)
 
     elif suite == "craftax":
@@ -300,11 +313,10 @@ def run_ppo(args: Args):
     action_space = env.action_space(env_params)
     discrete = isinstance(action_space, gymnax.environments.spaces.Discrete)
     try:
-        obs_space_shape = env.observation_space(env_params).shape
+        obs_dim = int(np.prod(env.observation_space(env_params).shape))
     except Exception:
         obs, _ = env.reset(jax.random.key(0), env_params)
-        obs_space_shape = obs.shape
-    obs_dim = int(np.prod(obs_space_shape))
+        obs_dim = int(np.prod(obs.shape))
     act_dim = int(action_space.n) if discrete else int(np.prod(action_space.shape))
 
     print(f"\nPPO (Rejax) | {args.env}")

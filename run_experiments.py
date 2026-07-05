@@ -387,11 +387,111 @@ def suite_thesis() -> List[RunSpec]:
     return runs
 
 
+def suite_moreseeds() -> List[RunSpec]:
+    """
+    2-3h follow-up: expand to 10 seeds on the three fastest environments and
+    fill the PPO jumanji/Snake gap (all 3 seeds failed overnight with a shape
+    error that is now fixed in ppo_baseline.py).
+
+    Timing basis (observed from thesis run):
+      CartPole  QEggRoll ~3.5 min/seed,  PPO ~20 sec/seed
+      Pendulum  QEggRoll ~5   min/seed,  PPO ~30 sec/seed
+      navix     QEggRoll ~8   min/seed,  PPO ~55 sec/seed
+      jumanji   PPO      ~unknown, estimated ~5 min/seed (post-fix)
+
+    Budget breakdown (seeds 3-9 = 7 new seeds per env):
+      CartPole  QE+PPO  x7  ≈  40 min
+      Pendulum  QE+PPO  x7  ≈  40 min
+      jumanji   PPO     x3  ≈   6 min  (gap fill, seeds 0-2)
+                              ≈  86 min ≈ 1.5h
+    """
+    runs: List[RunSpec] = []
+    tag = "thesis"
+    EGG_BASE = {"noise_size_exp": 24, "log_every": 20}
+
+    def egg(env, seeds_range, pop, epochs, **extra):
+        flags = {**EGG_BASE, "pop_size": pop, "num_epochs": epochs, **extra}
+        return [RunSpec("QEggRoll", env, s, tag=tag, flags=flags) for s in seeds_range]
+
+    def ppo(env, seeds_range, total_timesteps=None):
+        flags = {"total_timesteps": total_timesteps} if total_timesteps else {}
+        return [RunSpec("PPO", env, s, tag=tag, flags=flags) for s in seeds_range]
+
+    NEW = range(3, 10)  # seeds 3-9
+
+    # ── Expand CartPole to 10 seeds ───────────────────────────────────────────
+    runs += egg("CartPole-v1", NEW, pop=512, epochs=1000)
+    runs += ppo("CartPole-v1", NEW, total_timesteps=2_000_000)
+
+    # ── Expand Pendulum to 10 seeds ───────────────────────────────────────────
+    runs += egg("Pendulum-v1", NEW, pop=512, epochs=800)
+    runs += ppo("Pendulum-v1", NEW, total_timesteps=4_000_000)
+
+    # ── Fill jumanji/Snake PPO gap (seeds 0-2 failed with shape error) ───────
+    runs += ppo("jumanji/Snake-v1", range(3), total_timesteps=4_000_000)
+
+    return runs
+
+
+def suite_kinetix() -> List[RunSpec]:
+    """
+    2h follow-up focused on kinetix/s — the highest-variance result.
+    QEggRoll n=2 std=6.68 is unreportable; 2 more seeds bring it to n=4.
+    PPO is fast so expand to n=9 for completeness.
+
+    Timing (observed): QEggRoll ~38 min/seed, PPO ~5 min/seed.
+      QEggRoll seeds 2,3  (2 × 38) ≈  76 min
+      PPO      seeds 2-8  (7 ×  5) ≈  35 min
+                                    ≈ 111 min
+    """
+    runs: List[RunSpec] = []
+    tag = "thesis"
+    EGG_BASE = {"noise_size_exp": 24, "log_every": 20}
+    KENV = "kinetix/s/h1_thrust_over_ball"
+
+    for s in range(2, 4):
+        runs.append(RunSpec("QEggRoll", KENV, s, tag=tag,
+                            flags={**EGG_BASE, "pop_size": 256, "num_epochs": 300}))
+    for s in range(2, 9):
+        runs.append(RunSpec("PPO", KENV, s, tag=tag,
+                            flags={"total_timesteps": 4_000_000}))
+    return runs
+
+
+def suite_rerun_continuous() -> List[RunSpec]:
+    """
+    Re-run QEggRoll on continuous environments after removing the accidental
+    residual connection from IntMLPContinuous.  PPO results are unaffected.
+
+    Pendulum : seeds 0-9  (params match thesis + moreseeds)
+    Kinetix/s: seeds 0-3  (params match thesis + kinetix)
+
+    Run with --force to overwrite the stale result files:
+      python run_experiments.py rerun_continuous --force --timeout 0 --logfile rerun.log
+    """
+    runs: List[RunSpec] = []
+    tag      = "thesis"
+    EGG_BASE = {"noise_size_exp": 24, "log_every": 20}
+
+    for s in range(10):
+        runs.append(RunSpec("QEggRoll", "Pendulum-v1", s, tag=tag,
+                            flags={**EGG_BASE, "pop_size": 512, "num_epochs": 800}))
+
+    for s in range(4):
+        runs.append(RunSpec("QEggRoll", "kinetix/s/h1_thrust_over_ball", s, tag=tag,
+                            flags={**EGG_BASE, "pop_size": 256, "num_epochs": 300}))
+
+    return runs
+
+
 SUITES = {
-    "test":      suite_test,
-    "test_all":  suite_test_all,
-    "overnight": suite_overnight,
-    "thesis":    suite_thesis,
+    "test":               suite_test,
+    "test_all":           suite_test_all,
+    "overnight":          suite_overnight,
+    "thesis":             suite_thesis,
+    "moreseeds":          suite_moreseeds,
+    "kinetix":            suite_kinetix,
+    "rerun_continuous":   suite_rerun_continuous,
 }
 
 

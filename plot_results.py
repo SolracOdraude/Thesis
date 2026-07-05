@@ -138,6 +138,37 @@ def ax_learning_curve(ax, grouped, x_key="env_steps", log_x=False, title=""):
     ax.legend(loc="lower right")
 
 
+def ax_learning_curve_normalised(ax, grouped, title=""):
+    """
+    x-axis is training progress in [0, 100%], independent of how many env_steps
+    or wall-clock seconds each method consumed. Both QEggRoll and PPO start at 0
+    and end at 100 so their learning trajectories are directly comparable even
+    when their absolute step counts differ by orders of magnitude.
+    """
+    GRID = np.linspace(0, 100, 300)
+    for method, runs in grouped.items():
+        c = _color(method)
+        interp_runs = []
+        for r in runs:
+            n  = len(r["log"])
+            xs = np.linspace(0, 100, n)
+            ys = np.array([e["eval_return"] for e in r["log"]])
+            ax.plot(xs, ys, color=c, alpha=0.18, linewidth=0.9, linestyle=_ls(method))
+            interp_runs.append(np.interp(GRID, xs, ys))
+        mat  = np.array(interp_runs)
+        mean = mat.mean(0)
+        std  = mat.std(0)
+        ax.plot(GRID, mean, color=c, linewidth=2.2, linestyle=_ls(method), label=method)
+        ax.fill_between(GRID, mean - std, mean + std, color=c, alpha=0.15)
+
+    ax.set_xlabel("Training Progress (%)")
+    ax.set_xlim(0, 100)
+    ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:.0f}%"))
+    ax.set_ylabel("Eval Return")
+    ax.set_title(title)
+    ax.legend(loc="lower right")
+
+
 def ax_final_performance(ax, grouped):
     """Box + scatter of final eval returns per method."""
     methods = sorted(grouped)
@@ -287,13 +318,15 @@ def _save(fig, path_no_ext):
 
 def figure_learning_curves(env, grouped, out_dir):
     setup_style()
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    fig.suptitle(f"{env} - Learning Curves", fontsize=14, fontweight="bold")
+    fig, axes = plt.subplots(1, 3, figsize=(21, 5))
+    fig.suptitle(f"{env} — Learning Curves", fontsize=14, fontweight="bold")
 
     ax_learning_curve(axes[0], grouped, x_key="env_steps", log_x=True,
                       title="Sample Efficiency  (log x-axis)")
     ax_learning_curve(axes[1], grouped, x_key="wall_time",
-                      title="Computational Efficiency")
+                      title="Wall-clock Time")
+    ax_learning_curve_normalised(axes[2], grouped,
+                      title="Training Progress  (methods aligned)")
 
     plt.tight_layout()
     _save(fig, os.path.join(out_dir, f"{env.replace('/', '_')}_learning_curves"))

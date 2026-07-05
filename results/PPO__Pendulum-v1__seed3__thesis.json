@@ -1,0 +1,87 @@
+{
+  "method": "PPO",
+  "env": "Pendulum-v1",
+  "seed": 3,
+  "config": {
+    "num_envs": 256,
+    "num_steps": 256,
+    "num_epochs": 16,
+    "num_minibatches": 16,
+    "learning_rate": 0.0003,
+    "gamma": 0.999,
+    "gae_lambda": 0.95,
+    "clip_eps": 0.1,
+    "vf_coef": 1,
+    "ent_coef": 0.001,
+    "max_grad_norm": 1,
+    "normalize_obs": true,
+    "normalize_rew": false,
+    "rew_norm_discount": 0.99,
+    "skip_initial_eval": false,
+    "layer_size": 256,
+    "n_layers": 3,
+    "activation": "pqn",
+    "seed": 3,
+    "total_timesteps": 4000000,
+    "eval_freq": 655360,
+    "max_steps_per_episode": 200
+  },
+  "log": [
+    {
+      "env_steps": 0,
+      "wall_time": 0.0,
+      "eval_return": -1504.478759765625,
+      "eval_return_std": 228.685546875,
+      "train_return": null
+    },
+    {
+      "env_steps": 655360,
+      "wall_time": 3.434754405702863,
+      "eval_return": -1305.010009765625,
+      "eval_return_std": 263.4043273925781,
+      "train_return": null
+    },
+    {
+      "env_steps": 1310720,
+      "wall_time": 6.869508811405726,
+      "eval_return": -1150.336669921875,
+      "eval_return_std": 268.5091552734375,
+      "train_return": null
+    },
+    {
+      "env_steps": 1966080,
+      "wall_time": 10.30426321710859,
+      "eval_return": -973.0862426757812,
+      "eval_return_std": 279.7784118652344,
+      "train_return": null
+    },
+    {
+      "env_steps": 2621440,
+      "wall_time": 13.739017622811453,
+      "eval_return": -816.4302978515625,
+      "eval_return_std": 246.268798828125,
+      "train_return": null
+    },
+    {
+      "env_steps": 3276800,
+      "wall_time": 17.173772028514318,
+      "eval_return": -776.318359375,
+      "eval_return_std": 216.12669372558594,
+      "train_return": null
+    },
+    {
+      "env_steps": 3932160,
+      "wall_time": 20.60852643421718,
+      "eval_return": -758.8369140625,
+      "eval_return_std": 233.31539916992188,
+      "train_return": null
+    },
+    {
+      "env_steps": 4587520,
+      "wall_time": 24.043280839920044,
+      "eval_return": -576.844970703125,
+      "eval_return_std": 351.93975830078125,
+      "train_return": null
+    }
+  ]
+}

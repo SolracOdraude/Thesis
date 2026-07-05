@@ -56,7 +56,7 @@ from main import (
     CommonInit, CommonParams, PARAM, MM_PARAM, EXCLUDED,
     recursive_scan_split, simple_es_tree_key,
     merge_inits, merge_frozen, call_submodule,
-    Model, Parameter, MM, Linear, EGG_LN, clipped_add, IntMLP,
+    Model, Parameter, MM, Linear, EGG_LN, IntMLP,
     QEggRoll, DTYPE, MAX, FIXED_POINT, FBIT,
 )
 from hparams import EGGROLL_HPARAMS
@@ -182,10 +182,9 @@ class IntMLPContinuous(Model):
         n_layer = common_params.frozen_params["n_layer"]
         x = call_submodule(Linear, "proj", common_params, x)
         for i in range(n_layer):
-            residual = x
             x = call_submodule(EGG_LN, f"ln{i}", common_params, x)
             x = call_submodule(Linear, f"linear{i}", common_params, x)
-            x = clipped_add(x, residual)
+            # residual removed: was an accidental carry-over from an earlier test
         logits_int8 = call_submodule(Linear, "head", common_params, x)
         # Dequantize fixed-point int8 → float, squash to (-1, 1)
         return jnp.tanh(logits_int8.astype(jnp.float32) / (2 ** FIXED_POINT))
