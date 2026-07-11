@@ -30,26 +30,31 @@ import scienceplots  # noqa: F401 — registers the styles
 
 # ── Grid axes (must match run_ablation.py) ────────────────────────────────────
 
-POP_SIZES    = [128, 256, 512]
+POP_SIZES    = [256, 512, 1024]
 RANKS        = [1, 2, 4]
 SIGMA_SHIFTS = [1, 2, 4]
-N_EVALS      = [1, 2, 4]
+N_EVALS      = [1, 3, 4]
 
 # Light → dark sequential blue keyed on k (same hue as QEggRoll in plot_results.py)
-K_COLOR  = {1: "#90CAF9", 2: "#2196F3", 4: "#0D47A1"}
-K_LS     = {1: "-",       2: "-",       4: "-"}
-K_MARKER = {1: "o",       2: "s",       4: "^"}   # circle / square / triangle
+K_COLOR  = {1: "#90CAF9", 3: "#2196F3", 4: "#0D47A1"}
+K_LS     = {1: "-",       3: "-",       4: "-"}
+K_MARKER = {1: "o",       3: "s",       4: "^"}   # circle / square / triangle
+
+# Effective perturbation scale per sigma_shift value.
+# Mapping from hparams.py: 2^-(FIXED_POINT + sigma_shift) × max_int8 ≈ 0.5, 0.2, 0.05
+# (matches the float EggRoll σ equivalents listed in hparams.py)
+SIGMA_DISPLAY = {1: 0.5, 2: 0.25, 4: 0.05}
 
 ENV_CONFIG = {
     "CartPole-v1": {
-        "min_return":  0.0,
-        "max_return":  500.0,
-        "tag_re":      re.compile(r"abl_p(\d+)_r(\d+)_s(\d+)_k(\d+)\.json$"),
+        "y_lo":   0.0,
+        "y_hi":   500.0,
+        "tag_re": re.compile(r"abl_p(\d+)_r(\d+)_s(\d+)_k(\d+)\.json$"),
     },
     "Pendulum-v1": {
-        "min_return": -1800.0,
-        "max_return": -900.0,
-        "tag_re":      re.compile(r"abl_pendulum_p(\d+)_r(\d+)_s(\d+)_k(\d+)\.json$"),
+        "y_lo":  -1500.0,
+        "y_hi":   0.0,
+        "tag_re": re.compile(r"abl_pendulum_p(\d+)_r(\d+)_s(\d+)_k(\d+)\.json$"),
     },
 }
 
@@ -110,13 +115,11 @@ def _extract(run):
 
 # ── Per-rank learning-curve figure ────────────────────────────────────────────
 
-def figure_rank(rank: int, data: dict, env: str, out_dir: str):
+def figure_rank(rank: int, data: dict, env: str, out_dir: str, y_lo: float, y_hi: float):
     """
     3x3 subplot grid (sigma_shift columns x pop_size rows).
-    k = 1, 2, 4 overlaid as lines in each subplot.
+    k = 1, 3, 4 overlaid as lines in each subplot.
     """
-    y_lo  = ENV_CONFIG[env]["min_return"]
-    y_hi  = ENV_CONFIG[env]["max_return"]
     y_pad = (y_hi - y_lo) * 0.05
 
     fig, axes = plt.subplots(
@@ -126,7 +129,7 @@ def figure_rank(rank: int, data: dict, env: str, out_dir: str):
         #gridspec_kw={"hspace": 0.50, "wspace": 0.15},
     )
     fig.suptitle(
-        f"QEggRoll Ablation — {env}   (rank = {rank})",
+        f"Ablation on {env} (LoRA rank = {rank})",
         fontsize=13, fontweight="bold",
     )
 
@@ -135,8 +138,7 @@ def figure_rank(rank: int, data: dict, env: str, out_dir: str):
             ax = axes[ri, ci]
 
             if ri == 0:
-                sigma_real = 2.0 ** -(4 + sig)
-                ax.set_title(f"σ_shift = {sig}  (σ ≈ {sigma_real:.4f})", fontsize=10)
+                ax.set_title(f"σ_shift = {sig}  (σ ≈ {SIGMA_DISPLAY[sig]})", fontsize=10)
 
             if ci == 0:
                 ax.set_ylabel(f"pop = {pop}\nEval Return", fontsize=10)
@@ -171,10 +173,8 @@ def figure_rank(rank: int, data: dict, env: str, out_dir: str):
 
 # ── Summary: marginal effect of each parameter ────────────────────────────────
 
-def figure_summary(data: dict, env: str, out_dir: str):
+def figure_summary(data: dict, env: str, out_dir: str, y_lo: float, y_hi: float):
     """4-panel bar chart: mean peak return as each hyperparameter varies."""
-    y_lo  = ENV_CONFIG[env]["min_return"]
-    y_hi  = ENV_CONFIG[env]["max_return"]
     span  = y_hi - y_lo
     peaks = {key: float(_extract(run)[1].max()) for key, run in data.items()}
 
@@ -240,6 +240,17 @@ def figure_summary(data: dict, env: str, out_dir: str):
     _save(fig, os.path.join(out_dir, "ablation_summary"))
 
 
+# ── Deep-pendulum convergence figure ─────────────────────────────────────────
+
+def _smooth(ys: np.ndarray, window: int = 7) -> np.ndarray:
+    if window <= 1 or len(ys) < window:
+        return ys
+    half = window // 2
+    valid = np.convolve(ys, np.ones(window) / window, mode="valid")
+    # keep original edge values to avoid zero-padding artifacts
+    return np.concatenate([ys[:half], valid, ys[len(ys) - (window - 1 - half):]])
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
@@ -265,14 +276,18 @@ def main():
 
     os.makedirs(out_dir, exist_ok=True)
 
+    y_lo = ENV_CONFIG[args.env]["y_lo"]
+    y_hi = ENV_CONFIG[args.env]["y_hi"]
+
     for i, rank in enumerate(RANKS, 1):
         print(f"[{i}/{len(RANKS)}] rank={rank}")
-        figure_rank(rank, data, args.env, out_dir)
+        figure_rank(rank, data, args.env, out_dir, y_lo, y_hi)
 
     print("[summary]")
-    figure_summary(data, args.env, out_dir)
+    figure_summary(data, args.env, out_dir, y_lo, y_hi)
 
-    print(f"\nDone — {len(RANKS) + 1} figures written to {out_dir}/")
+    n_figs = len(RANKS) + 1
+    print(f"\nDone — {n_figs} figures written to {out_dir}/")
 
 
 if __name__ == "__main__":

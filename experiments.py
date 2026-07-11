@@ -1,25 +1,19 @@
 """
 experiments.py
 ==============
-Reproduction of the EGGROLL paper's RL benchmark suite using QEggRoll (int8).
-
-Environments (paper Tables 3–16):
+QEggRoll (int8 ES) training loop for the three thesis target environments:
   gymnax  : CartPole-v1, Pendulum-v1
-  brax    : ant, humanoid, inverted_double_pendulum
-  craftax : Craftax-Classic-Symbolic-AutoReset-v1, Craftax-Symbolic-AutoReset-v1
-  jumanji : Game2048-v1, Knapsack-v1, Snake-v1
-  kinetix : hard_pinball (l), h17_thrustcontrol_left (m), h1_thrust_over_ball (s)
-  navix   : DoorKey-8x8-v0, Dynamic-Obstacles-Random-6x6-v0, FourRooms-8x8-v0
+  kinetix : h1_thrust_over_ball (s)
 
-Install missing suites as needed:
-  pip install gymnax brax craftax jumanji navix
-  pip install git+https://github.com/FLAIROx/Kinetix.git  # RL kinetix (not PyPI)
+Install:
+  pip install gymnax
+  pip install git+https://github.com/FLAIROx/Kinetix.git
 
 Architectural differences from the paper's float EggRoll
 ---------------------------------------------------------
   1. Weights/activations: int8 fixed-point (FIXED_POINT=4) vs float32.
-  2. Nonlinearity:  int8 symmetric clipping ±127 vs pqn = relu(layer_norm(x)).
-     pqn zeroes negatives; our model preserves them — this is a genuine difference.
+  2. Nonlinearity:  integer ReLU after each EGG_LN: clip(x, 0, 127) vs pqn = relu(layer_norm(x)).
+     Both zero negatives — architecturally equivalent to pqn.
   3. Update rule: ±1 integer steps gated by threshold vs optax gradient step.
      As a result, paper hyperparameters learning_rate / lr_decay / optimizer do not
      apply to this implementation; see hparams.py for the mapping that was used.
@@ -30,8 +24,8 @@ Architectural differences from the paper's float EggRoll
 Usage
 -----
   python experiments.py --env CartPole-v1
-  python experiments.py --env brax/ant --num_epochs 500
-  python experiments.py --env jumanji/Snake-v1 --seed 1
+  python experiments.py --env Pendulum-v1 --seed 1
+  python experiments.py --env kinetix/s/h1_thrust_over_ball
 """
 
 import os
@@ -62,37 +56,11 @@ from main import (
 from hparams import EGGROLL_HPARAMS
 from metrics import RunLogger
 
-# ── Optional environment suite imports ────────────────────────────────────────
-
 try:
     import gymnax
     HAS_GYMNAX = True
 except ImportError:
     HAS_GYMNAX = False
-
-try:
-    import brax.envs as brax_envs
-    HAS_BRAX = True
-except ImportError:
-    HAS_BRAX = False
-
-try:
-    import craftax
-    HAS_CRAFTAX = True
-except ImportError:
-    HAS_CRAFTAX = False
-
-try:
-    import jumanji
-    HAS_JUMANJI = True
-except ImportError:
-    HAS_JUMANJI = False
-
-try:
-    import navix
-    HAS_NAVIX = True
-except ImportError:
-    HAS_NAVIX = False
 
 try:
     import kinetix
@@ -127,6 +95,8 @@ class Args:
     n_parallel_evaluations: Optional[int]   = None
     hidden_dim:             Optional[int]   = None   # ablation: network width
     noise_size_exp:         Optional[int]   = None   # ablation: BIG_RAND_MATRIX size
+    action_scale:           Optional[float] = None   # output scale (e.g. 2.0 for Pendulum ±2)
+    max_update_step:        Optional[int]   = None   # 1=pm1, 2=capped ±2
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -183,8 +153,8 @@ class IntMLPContinuous(Model):
         x = call_submodule(Linear, "proj", common_params, x)
         for i in range(n_layer):
             x = call_submodule(EGG_LN, f"ln{i}", common_params, x)
+            x = jnp.clip(x, 0, MAX).astype(DTYPE)   # integer ReLU: commented out — int8 clipping is the nonlinearity
             x = call_submodule(Linear, f"linear{i}", common_params, x)
-            # residual removed: was an accidental carry-over from an earlier test
         logits_int8 = call_submodule(Linear, "head", common_params, x)
         # Dequantize fixed-point int8 → float, squash to (-1, 1)
         return jnp.tanh(logits_int8.astype(jnp.float32) / (2 ** FIXED_POINT))
@@ -219,6 +189,7 @@ def make_gymnax_rollout(env, env_params, cfg,
     obs_scale     = cfg["obs_scale"]
     deterministic = cfg["deterministic_policy"]
     action_type   = cfg["action_type"]
+    action_scale  = cfg.get("action_scale", 1.0)
 
     def rollout(noiser_params_, params_, iterinfo_, rng_key):
         def step_fn(carry, _):
@@ -231,7 +202,8 @@ def make_gymnax_rollout(env, env_params, cfg,
             if action_type == "discrete":
                 action = select_action_discrete(out, act_rng, deterministic)
             else:
-                action = select_action_continuous(out, log_std, act_rng, deterministic)
+                action = select_action_continuous(out, log_std, act_rng, deterministic) \
+                         * action_scale
             next_obs, next_state, reward, next_done, _ = env.step(
                 step_rng, state, action, env_params)
             total_return = total_return + reward * (1.0 - done.astype(jnp.float32))
@@ -250,150 +222,6 @@ def make_gymnax_rollout(env, env_params, cfg,
     return rollout
 
 
-# ── brax ──────────────────────────────────────────────────────────────────────
-
-def make_brax_rollout(env, cfg,
-                      frozen_noiser_params, frozen_params, es_tree_key,
-                      log_std=None):
-    obs_scale     = cfg["obs_scale"]
-    deterministic = cfg["deterministic_policy"]
-    max_steps     = cfg["max_steps"]
-
-    def rollout(noiser_params_, params_, iterinfo_, rng_key):
-        def step_fn(carry, _):
-            state, total_return, done = carry
-            obs_int8 = encode_obs(state.obs, obs_scale)
-            action_mean = IntMLPContinuous.forward(
-                QEggRoll, frozen_noiser_params, noiser_params_,
-                frozen_params, params_, es_tree_key, iterinfo_, obs_int8)
-            # brax actions are typically in [-1, 1]; tanh already applied in forward
-            action = action_mean   # deterministic by default for brax
-            next_state = env.step(state, action)
-            total_return = total_return + next_state.reward * (1.0 - done.astype(jnp.float32))
-            return (next_state, total_return, next_state.done), None
-
-        init_state = env.reset(rng_key)
-        (_, total_return, _), _ = jax.lax.scan(
-            step_fn,
-            (init_state, jnp.array(0.0), jnp.array(0.0)),
-            None,
-            length=max_steps,
-        )
-        return total_return
-
-    return rollout
-
-
-# ── craftax (gymnax-compatible API) ──────────────────────────────────────────
-
-def make_craftax_rollout(env, env_params, cfg,
-                         frozen_noiser_params, frozen_params, es_tree_key):
-    obs_scale = cfg["obs_scale"]
-    max_steps = cfg["max_steps"]
-    deterministic = cfg["deterministic_policy"]
-
-    def rollout(noiser_params_, params_, iterinfo_, rng_key):
-        def step_fn(carry, _):
-            obs, state, done, total_return, rng = carry
-            flat = flatten_obs(obs)
-            obs_int8 = encode_obs(flat, obs_scale)
-            logits = IntMLP.forward(
-                QEggRoll, frozen_noiser_params, noiser_params_,
-                frozen_params, params_, es_tree_key, iterinfo_, obs_int8)
-            rng, act_rng, step_rng = jax.random.split(rng, 3)
-            action = select_action_discrete(logits, act_rng, deterministic)
-            next_obs, next_state, reward, next_done, _ = env.step(
-                step_rng, state, action, env_params)
-            total_return = total_return + reward * (1.0 - done.astype(jnp.float32))
-            return (next_obs, next_state, next_done, total_return, rng), None
-
-        rng_reset, rng_ep = jax.random.split(rng_key)
-        obs, state = env.reset(rng_reset, env_params)
-        (_, _, _, total_return, _), _ = jax.lax.scan(
-            step_fn,
-            (obs, state, jnp.array(False), jnp.array(0.0), rng_ep),
-            None, length=max_steps,
-        )
-        return total_return
-
-    return rollout
-
-
-# ── jumanji ───────────────────────────────────────────────────────────────────
-
-def make_jumanji_rollout(env, cfg,
-                         frozen_noiser_params, frozen_params, es_tree_key):
-    obs_scale = cfg["obs_scale"]
-    max_steps = cfg["max_steps"]
-    deterministic = cfg["deterministic_policy"]
-
-    def rollout(noiser_params_, params_, iterinfo_, rng_key):
-        def step_fn(carry, _):
-            # In jumanji, observations are in the timestep, not the state.
-            state, timestep, total_return, done, rng = carry
-            flat = flatten_obs(timestep.observation)
-            obs_int8 = encode_obs(flat, obs_scale)
-            logits = IntMLP.forward(
-                QEggRoll, frozen_noiser_params, noiser_params_,
-                frozen_params, params_, es_tree_key, iterinfo_, obs_int8)
-            rng, act_rng = jax.random.split(rng)
-            action = select_action_discrete(logits, act_rng, deterministic)
-            next_state, next_timestep = env.step(state, action)
-            reward = next_timestep.reward
-            total_return = total_return + reward * (1.0 - done.astype(jnp.float32))
-            return (next_state, next_timestep, total_return, timestep.last(), rng), None
-
-        rng_reset, rng_ep = jax.random.split(rng_key)
-        init_state, init_timestep = env.reset(rng_reset)
-        (_, _, total_return, _, _), _ = jax.lax.scan(
-            step_fn,
-            (init_state, init_timestep, jnp.array(0.0), jnp.array(False), rng_ep),
-            None, length=max_steps,
-        )
-        return total_return
-
-    return rollout
-
-
-# ── navix ─────────────────────────────────────────────────────────────────────
-
-def make_navix_rollout(env, cfg,
-                       frozen_noiser_params, frozen_params, es_tree_key):
-    """
-    Navix uses a timestep-based API: env.reset(key) → timestep,
-    env.step(timestep, action) → timestep.
-    The observation is at timestep.observation (typically an integer grid array).
-    """
-    obs_scale = cfg["obs_scale"]
-    max_steps = cfg["max_steps"]
-    deterministic = cfg["deterministic_policy"]
-
-    def rollout(noiser_params_, params_, iterinfo_, rng_key):
-        def step_fn(carry, _):
-            timestep, total_return, rng = carry
-            flat = flatten_obs(timestep.observation)
-            obs_int8 = encode_obs(flat, obs_scale)
-            logits = IntMLP.forward(
-                QEggRoll, frozen_noiser_params, noiser_params_,
-                frozen_params, params_, es_tree_key, iterinfo_, obs_int8)
-            rng, act_rng = jax.random.split(rng)
-            action = select_action_discrete(logits, act_rng, deterministic)
-            next_timestep = env.step(timestep, action)
-            done = timestep.is_done()
-            total_return = total_return + next_timestep.reward * (1.0 - done.astype(jnp.float32))
-            return (next_timestep, total_return, rng), None
-
-        init_timestep = env.reset(rng_key)
-        (_, total_return, _), _ = jax.lax.scan(
-            step_fn,
-            (init_timestep, jnp.array(0.0), rng_key),
-            None, length=max_steps,
-        )
-        return total_return
-
-    return rollout
-
-
 # ── kinetix ───────────────────────────────────────────────────────────────────
 
 def make_kinetix_rollout(env, env_params, cfg,
@@ -406,6 +234,7 @@ def make_kinetix_rollout(env, env_params, cfg,
     obs_scale     = cfg["obs_scale"]
     max_steps     = cfg["max_steps"]
     deterministic = cfg["deterministic_policy"]
+    action_scale  = cfg.get("action_scale", 1.0)
 
     def rollout(noiser_params_, params_, iterinfo_, rng_key):
         def step_fn(carry, _):
@@ -415,7 +244,8 @@ def make_kinetix_rollout(env, env_params, cfg,
                 QEggRoll, frozen_noiser_params, noiser_params_,
                 frozen_params, params_, es_tree_key, iterinfo_, obs_int8)
             rng, act_rng, step_rng = jax.random.split(rng, 3)
-            action = select_action_continuous(action_mean, log_std, act_rng, deterministic)
+            action = select_action_continuous(action_mean, log_std, act_rng, deterministic) \
+                     * action_scale
             next_obs, next_state, reward, next_done, _ = env.step(
                 step_rng, state, action, env_params)
             total_return = total_return + reward * (1.0 - done.astype(jnp.float32))
@@ -463,65 +293,6 @@ def setup_environment(cfg, key, frozen_noiser_params, frozen_params, es_tree_key
         fn = make_gymnax_rollout(env, env_params, cfg,
                                  frozen_noiser_params, frozen_params, es_tree_key,
                                  model_cls, log_std)
-        eval_fn = lambda np_, p, rng: fn(np_, p, None, rng)
-
-    elif suite == "brax":
-        assert HAS_BRAX, "pip install brax"
-        env = brax_envs.get_environment(cfg["brax_name"])
-
-        dummy_state = env.reset(jax.random.key(0))
-        obs_dim = int(dummy_state.obs.shape[-1])
-        act_dim = int(env.action_size)
-
-        fn = make_brax_rollout(env, cfg,
-                               frozen_noiser_params, frozen_params, es_tree_key,
-                               log_std)
-        eval_fn = lambda np_, p, rng: fn(np_, p, None, rng)
-
-    elif suite == "craftax":
-        assert HAS_CRAFTAX, "pip install craftax"
-        from craftax.craftax.envs.craftax_symbolic_env import CraftaxSymbolicEnv
-        try:
-            env, env_params = gymnax.make(cfg["craftax_name"])
-        except ValueError:
-            env = CraftaxSymbolicEnv()
-            env_params = env.default_params
-
-        dummy_key = jax.random.key(0)
-        obs, _ = env.reset(dummy_key, env_params)
-        obs_dim = int(np.prod(flatten_obs(obs).shape))
-        act_dim = int(env.action_space(env_params).n)
-
-        fn = make_craftax_rollout(env, env_params, cfg,
-                                  frozen_noiser_params, frozen_params, es_tree_key)
-        eval_fn = lambda np_, p, rng: fn(np_, p, None, rng)
-
-    elif suite == "jumanji":
-        assert HAS_JUMANJI, "pip install jumanji"
-        env = jumanji.make(cfg["jumanji_name"])
-
-        dummy_key = jax.random.key(0)
-        _, init_ts = env.reset(dummy_key)
-        obs_dim = int(np.prod(flatten_obs(init_ts.observation).shape))
-        act_spec = env.action_spec
-        act_dim = int(act_spec.num_values) if hasattr(act_spec, "num_values") \
-                  else int(np.prod(act_spec.shape))
-
-        fn = make_jumanji_rollout(env, cfg,
-                                  frozen_noiser_params, frozen_params, es_tree_key)
-        eval_fn = lambda np_, p, rng: fn(np_, p, None, rng)
-
-    elif suite == "navix":
-        assert HAS_NAVIX, "pip install navix"
-        env = navix.make(cfg["navix_name"])
-
-        dummy_key = jax.random.key(0)
-        init_ts = env.reset(dummy_key)
-        obs_dim = int(np.prod(flatten_obs(init_ts.observation).shape))
-        act_dim = int(env.action_space.n)
-
-        fn = make_navix_rollout(env, cfg,
-                                frozen_noiser_params, frozen_params, es_tree_key)
         eval_fn = lambda np_, p, rng: fn(np_, p, None, rng)
 
     elif suite == "kinetix":
@@ -583,6 +354,8 @@ def run_experiment(args: Args):
     if args.sigma_shift            is not None: cfg["sigma_shift"]            = args.sigma_shift
     if args.rank                   is not None: cfg["rank"]                   = args.rank
     if args.n_parallel_evaluations is not None: cfg["n_parallel_evaluations"] = args.n_parallel_evaluations
+    if args.action_scale           is not None: cfg["action_scale"]           = args.action_scale
+    if args.max_update_step        is not None: cfg["max_update_step"]        = args.max_update_step
 
     suite       = cfg["suite"]
     action_type = cfg["action_type"]
@@ -595,7 +368,9 @@ def run_experiment(args: Args):
     print(f"\nEnvironment : {args.env}  ({suite})")
     print(f"Action type : {action_type}")
     print(f"pop_size={N}  rank={cfg['rank']}  sigma_shift={cfg['sigma_shift']}"
-          f"  hidden_dim={hidden_dim}  n_parallel_evaluations={K}")
+          f"  hidden_dim={hidden_dim}  n_parallel_evaluations={K}"
+          f"  action_scale={cfg.get('action_scale', 1.0)}"
+          f"  max_update_step={cfg.get('max_update_step', 1)}")
 
     key = jax.random.key(args.seed)
     model_key, es_key, rollout_key = jax.random.split(key, 3)
@@ -659,30 +434,31 @@ def run_experiment(args: Args):
         fast_fitness=cfg["fast_fitness"],
         update_batch_size=update_batch_size,
         noise_size=noise_size,
+        max_update_step=cfg.get("max_update_step", 1),
     )
 
     # ── Build rollout fns ─────────────────────────────────────────────────────
     perturbed_rollout, eval_rollout_fn, _, _ = setup_environment(
         cfg, key, frozen_noiser_params, frozen_params, es_tree_key, log_std)
 
-    # Training rollout: vmap over N population members
-    # If K > 1: inner vmap over K episode seeds per member
+    # Eval rollout: vmap over eval_episodes seeds, single dispatch per checkpoint
+    v_eval = jax.jit(jax.vmap(eval_rollout_fn, in_axes=(None, None, 0)))
+
+    # Training rollout: single vmap over N*K members (flat, no nesting).
+    # For K > 1 each member's ii is tiled K times so all K episodes use the
+    # same perturbation but independent rng seeds; returns are averaged per member.
+    v_train = jax.jit(jax.vmap(perturbed_rollout, in_axes=(None, None, 0, 0)))
+
     if K == 1:
-        v_train = jax.jit(jax.vmap(
-            perturbed_rollout, in_axes=(None, None, 0, 0)))
         def get_raw_returns(np_, p, ii, rngs):
-            return v_train(np_, p, ii, rngs)   # (N,)
+            return v_train(np_, p, ii, rngs)                          # (N,)
     else:
-        # rngs shape: (N, K)
-        # inner vmap over K seeds with fixed iterinfo for that member
-        v_train_inner = jax.vmap(
-            lambda np_, p, ii, rng: perturbed_rollout(np_, p, ii, rng),
-            in_axes=(None, None, None, 0))
-        v_train = jax.jit(jax.vmap(
-            lambda np_, p, ii, rngs: v_train_inner(np_, p, ii, rngs).mean(),
-            in_axes=(None, None, 0, 0)))
         def get_raw_returns(np_, p, ii, rngs):
-            return v_train(np_, p, ii, rngs)   # (N,)
+            # ii: tuple of (N,) arrays → repeat each K times → (N*K,)
+            ii_flat  = jax.tree.map(lambda x: jnp.repeat(x, K), ii)
+            rngs_flat = rngs.reshape(N * K)                           # (N*K,)
+            flat = v_train(np_, p, ii_flat, rngs_flat)                # (N*K,)
+            return flat.reshape(N, K).mean(axis=1)                    # (N,)
 
     jit_update = jax.jit(
         lambda np_, p, f, ii:
@@ -697,6 +473,8 @@ def run_experiment(args: Args):
     _ = jax.block_until_ready(get_raw_returns(noiser_params, params, dummy_ii, dummy_rng))
     dummy_fits = jnp.zeros(N // 2, dtype=DTYPE)
     _ = jax.block_until_ready(jit_update(noiser_params, params, dummy_fits, dummy_ii))
+    dummy_eval_rngs = jax.random.split(rollout_key, args.eval_episodes)
+    _ = jax.block_until_ready(v_eval(noiser_params, params, dummy_eval_rngs))
     print("done.\n")
 
     # ── Metrics setup ─────────────────────────────────────────────────────────
@@ -741,8 +519,7 @@ def run_experiment(args: Args):
         if epoch % args.log_every == 0 or epoch == args.num_epochs - 1:
             rng, eval_key = jax.random.split(rng)
             eval_rngs  = jax.random.split(eval_key, args.eval_episodes)
-            eval_rets  = np.array([
-                float(eval_rollout_fn(noiser_params, params, r)) for r in eval_rngs])
+            eval_rets  = np.array(v_eval(noiser_params, params, eval_rngs))
             mean_eval  = float(eval_rets.mean())
             best_eval  = max(best_eval, mean_eval)
             mean_train = float(raw_returns.mean())

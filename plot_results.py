@@ -127,11 +127,12 @@ def ax_learning_curve(ax, grouped, x_key="env_steps", log_x=False, title=""):
         ax.plot(xs, mean, color=c, linewidth=2.2, linestyle=_ls(method), label=method)
         ax.fill_between(xs, mean - std, mean + std, color=c, alpha=0.15)
 
+    step_fmt = plt.FuncFormatter(lambda v, _: f"{v/1e6:.1f}M" if v >= 1e6 else
+                                               f"{v/1e3:.0f}K" if v >= 1e3 else str(int(v)))
     if log_x:
         ax.set_xscale("log")
-        ax.xaxis.set_major_formatter(
-            plt.FuncFormatter(lambda v, _: f"{v/1e6:.1f}M" if v >= 1e6 else
-                                           f"{v/1e3:.0f}K" if v >= 1e3 else str(int(v))))
+    if x_key == "env_steps":
+        ax.xaxis.set_major_formatter(step_fmt)
     ax.set_xlabel("Env Steps" if x_key == "env_steps" else "Wall-clock Time (s)")
     ax.set_ylabel("Eval Return")
     ax.set_title(title)
@@ -319,10 +320,10 @@ def _save(fig, path_no_ext):
 def figure_learning_curves(env, grouped, out_dir):
     setup_style()
     fig, axes = plt.subplots(1, 3, figsize=(21, 5))
-    fig.suptitle(f"{env} — Learning Curves", fontsize=14, fontweight="bold")
+    fig.suptitle(f"{env} (Learning Curves)", fontsize=14, fontweight="bold")
 
-    ax_learning_curve(axes[0], grouped, x_key="env_steps", log_x=True,
-                      title="Sample Efficiency  (log x-axis)")
+    ax_learning_curve(axes[0], grouped, x_key="env_steps", log_x=False,
+                      title="Sample Efficiency")
     ax_learning_curve(axes[1], grouped, x_key="wall_time",
                       title="Wall-clock Time")
     ax_learning_curve_normalised(axes[2], grouped,

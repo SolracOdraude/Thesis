@@ -8,11 +8,11 @@ Supports two environments:
   ablation_cartpole  — CartPole-v1  (discrete, ~3 h)
   ablation_pendulum  — Pendulum-v1  (continuous, ~4 h)
 
-Grid axes (same for both):
-  pop_size              : 128, 256, 512
+Grid axes:
+  pop_size              : 256, 512, 1024
   rank                  : 1, 2, 4
-  sigma_shift           : 1, 2, 4   (σ = 2^{-(4+s)} ≈ 0.031, 0.016, 0.004)
-  n_parallel_evaluations: 1, 2, 4
+  sigma_shift           : 1, 2, 4
+  n_parallel_evaluations: 1, 3, 4   (K=1 baseline; K=3 odd; K=4 even)
 
 3^4 = 81 runs per environment, seed 0.
 
@@ -44,25 +44,26 @@ NOISE_RE = re.compile(
 )
 
 SEED           = 0
-NOISE_SIZE_EXP = 24   # 16 MB noise table — no hash collisions at pop=512
+NOISE_SIZE_EXP = 28   # 256 MB noise table — well within memory; near-zero clamping after mask fix
 LOG_EVERY      = 20
+EVAL_EPISODES  = 20   # match the successful manual runs; 5 (default) is too noisy
 
-POP_SIZES    = [128, 256, 512]
+POP_SIZES    = [256, 512, 1024]
 RANKS        = [1, 2, 4]
 SIGMA_SHIFTS = [1, 2, 4]
-N_EVALS      = [1, 2, 4]
+N_EVALS      = [1, 3, 4]      # K=1 baseline; K=3 odd; K=4 even
 
 
 # ── Suite definitions ─────────────────────────────────────────────────────────
 
 def suite_ablation_cartpole() -> List[Dict]:
-    """81-run grid on CartPole-v1 (discrete control, 300 epochs)."""
+    """81-run grid on CartPole-v1 (discrete control, 500 epochs)."""
     runs = []
     for pop, rank, sig, npar in product(POP_SIZES, RANKS, SIGMA_SHIFTS, N_EVALS):
         tag = f"abl_p{pop}_r{rank}_s{sig}_k{npar}"
         runs.append({
             "env":                    "CartPole-v1",
-            "num_epochs":             300,
+            "num_epochs":             500,
             "pop_size":               pop,
             "rank":                   rank,
             "sigma_shift":            sig,
@@ -73,21 +74,22 @@ def suite_ablation_cartpole() -> List[Dict]:
 
 
 def suite_ablation_pendulum() -> List[Dict]:
-    """81-run grid on Pendulum-v1 (continuous control, 400 epochs).
+    """81-run grid on Pendulum-v1 (continuous control, 2000 epochs).
 
     Pendulum is a better ablation target than CartPole for continuous control:
       - sigma_shift matters more (large σ overshoots the torque range)
       - rank affects how precisely the perturbation shapes the continuous output
       - pop_size affects gradient estimate quality on a harder fitness landscape
-    400 epochs gives enough signal to distinguish failing from converging configs
-    while keeping each run to ~2-3 min.
+    2000 epochs captures full convergence behaviour across all configs.
+    K ∈ {1, 2, 3} — tests the odd-K hypothesis (odd antithetic-pair counts may
+    break symmetry in the Z-score signal in a beneficial way).
     """
     runs = []
     for pop, rank, sig, npar in product(POP_SIZES, RANKS, SIGMA_SHIFTS, N_EVALS):
         tag = f"abl_pendulum_p{pop}_r{rank}_s{sig}_k{npar}"
         runs.append({
             "env":                    "Pendulum-v1",
-            "num_epochs":             400,
+            "num_epochs":             2000,
             "pop_size":               pop,
             "rank":                   rank,
             "sigma_shift":            sig,
@@ -95,6 +97,7 @@ def suite_ablation_pendulum() -> List[Dict]:
             "tag":                    tag,
         })
     return runs
+
 
 
 SUITES = {
@@ -106,21 +109,25 @@ SUITES = {
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def result_path(cfg: Dict) -> str:
-    return RunLogger.default_path("QEggRoll", cfg["env"], SEED, "results", cfg["tag"])
+    seed = cfg.get("seed", SEED)
+    return RunLogger.default_path("QEggRoll", cfg["env"], seed, "results", cfg["tag"])
 
 
 def run_label(cfg: Dict) -> str:
-    return (f"QEggRoll  {cfg['env']}  seed{SEED}  "
+    seed = cfg.get("seed", SEED)
+    return (f"QEggRoll  {cfg['env']}  seed{seed}  "
             f"pop={cfg['pop_size']}  rank={cfg['rank']}  "
             f"sig={cfg['sigma_shift']}  k={cfg['n_parallel_evaluations']}")
 
 
 def build_command(python: str, cfg: Dict, max_cpus: int) -> List[str]:
+    seed = cfg.get("seed", SEED)
     cmd = [python, SCRIPT,
            "--env",                    cfg["env"],
-           "--seed",                   str(SEED),
+           "--seed",                   str(seed),
            "--num_epochs",             str(cfg["num_epochs"]),
            "--log_every",              str(LOG_EVERY),
+           "--eval_episodes",          str(EVAL_EPISODES),
            "--noise_size_exp",         str(NOISE_SIZE_EXP),
            "--pop_size",               str(cfg["pop_size"]),
            "--rank",                   str(cfg["rank"]),
@@ -129,6 +136,10 @@ def build_command(python: str, cfg: Dict, max_cpus: int) -> List[str]:
            "--run_tag",                cfg["tag"],
            "--save_results",
            ]
+    if "action_scale" in cfg:
+        cmd += ["--action_scale",    str(cfg["action_scale"])]
+    if "max_update_step" in cfg:
+        cmd += ["--max_update_step", str(cfg["max_update_step"])]
     if max_cpus > 0 and shutil.which("taskset"):
         cmd = ["taskset", "-c", f"0-{max_cpus-1}"] + cmd
     return cmd
@@ -143,6 +154,7 @@ def limited_env(max_cpus: int) -> Dict:
         flags = env.get("XLA_FLAGS", "")
         if "xla_cpu_multi_thread_eigen" not in flags:
             env["XLA_FLAGS"] = (flags + " --xla_cpu_multi_thread_eigen=false").strip()
+    env.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
     return env
 
 

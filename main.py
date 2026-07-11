@@ -294,7 +294,7 @@ def _get_common_start_idx(frozen_noiser_params, iterinfo, key):
     actual_key      = _fold_in(
         jax.random.key_data(jax.random.fold_in(key, true_epoch)),
         true_thread_idx)
-    start_idx = actual_key & (2**30 - 1)
+    start_idx = actual_key & (frozen_noiser_params["noise_size"] - 1)
     sign      = jnp.where(thread_id % 2 == 0, 1, -1)
     return start_idx, sign
 
@@ -319,12 +319,23 @@ def _common_update(frozen_noiser_params, noiser_params, param, Z, pop_size):
     threshold = noiser_params["update_threshold"] * int(np.sqrt(pop_size))
     if frozen_noiser_params["use_clt"]:
         threshold *= 4 ** FIXED_POINT
-    param_int32 = param.astype(jnp.int32)
-    return jnp.clip(
-        jnp.where(jnp.abs(Z) < threshold, param_int32,
-                  jnp.where(Z > 0, param_int32 + 1, param_int32 - 1)),
-        -MAX, MAX
-    ).astype(param.dtype)
+    param_int32  = param.astype(jnp.int32)
+    max_step     = frozen_noiser_params.get("max_update_step", 1)
+    below_thresh = jnp.abs(Z) < threshold
+    if max_step <= 1:
+        step = jnp.where(
+            below_thresh,
+            jnp.zeros_like(Z),
+            jnp.where(Z > 0, jnp.ones_like(Z), -jnp.ones_like(Z))
+        )
+    else:
+        # Allow ±max_step when signal is strong; same noise gate as pm1.
+        capped = jnp.clip(
+            jnp.round(Z.astype(jnp.float32) / threshold).astype(jnp.int32),
+            -max_step, max_step,
+        )
+        step = jnp.where(below_thresh, jnp.zeros_like(Z), capped)
+    return jnp.clip(param_int32 + step, -MAX, MAX).astype(param.dtype)
 
 def _lora_update(frozen_noiser_params, noiser_params, param, key, scores, iterinfo):
     update_batch = frozen_noiser_params["update_batch_size"]
@@ -373,7 +384,7 @@ class QEggRoll:
     def init_noiser(cls, params, sigma_shift, update_threshold, *,
                     dtype="int8", noise_seed=0, noise_reuse=1, rank=1,
                     use_clt=True, fast_fitness=True, update_batch_size=64,
-                    noise_size=2**args.noise_size_exp):
+                    noise_size=2**args.noise_size_exp, max_update_step=1):
         # Precompute lookup table for integer layer norm division:
         # DIVISION[abs_mean][numerator_uint16] -> int8
         division = jnp.clip(
@@ -383,11 +394,13 @@ class QEggRoll:
         ).astype(jnp.int8)
 
         frozen = {
-            "noise_reuse": noise_reuse,
-            "rank":        rank,
-            "use_clt":     use_clt,
-            "fast_fitness": fast_fitness,
-            "update_batch_size": update_batch_size
+            "noise_reuse":      noise_reuse,
+            "rank":             rank,
+            "use_clt":          use_clt,
+            "fast_fitness":     fast_fitness,
+            "update_batch_size": update_batch_size,
+            "max_update_step":  max_update_step,
+            "noise_size":       noise_size,
         }
 
         state = {
