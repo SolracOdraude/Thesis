@@ -238,11 +238,54 @@ def suite_kinetix() -> List[RunSpec]:
     return runs
 
 
+def suite_mountaincar() -> List[RunSpec]:
+    """
+    MountainCar-v0 and MountainCarContinuous-v0 — 10 seeds per method each.
+
+    QEggRoll parameters follow the ablation-informed choices in hparams.py
+    (pop=2048, rank=4).  sigma_shift differs per task: 1 for the hard-
+    exploration discrete task, 2 for the shaped-reward continuous task.
+
+    Step budgets (matching CartPole / Pendulum scale):
+      MountainCar           : 2048 × 200 × 500 ≈ 205M  → PPO 200M
+      MountainCarContinuous : 2048 × 999 × 200 ≈ 409M  → PPO 400M
+
+    Existing result files are skipped automatically.
+      python run_experiments.py mountaincar --timeout 0 --python python
+    """
+    runs: List[RunSpec] = []
+    tag = "thesis"
+    EGG_BASE = {"noise_size_exp": 28, "log_every": 20}
+
+    # Discrete MountainCar: hard-exploration, sigma_shift=1
+    # 500 epochs matches CartPole's epoch count (same max_steps=200, same pop).
+    runs += [RunSpec("QEggRoll", "MountainCar-v0", s, tag=tag,
+                     flags={**EGG_BASE, "pop_size": 2048, "num_epochs": 500,
+                            "rank": 4, "sigma_shift": 1})
+             for s in range(10)]
+    runs += [RunSpec("PPO", "MountainCar-v0", s, tag=tag,
+                     flags={"total_timesteps": 200_000_000})
+             for s in range(10)]
+
+    # Continuous MountainCar: shaped reward, sigma_shift=2.
+    # 200 epochs matches Pendulum's step budget (pop=2048 vs 4096 offset by 2×).
+    runs += [RunSpec("QEggRoll", "MountainCarContinuous-v0", s, tag=tag,
+                     flags={**EGG_BASE, "pop_size": 2048, "num_epochs": 200,
+                            "rank": 4, "sigma_shift": 2})
+             for s in range(10)]
+    runs += [RunSpec("PPO", "MountainCarContinuous-v0", s, tag=tag,
+                     flags={"total_timesteps": 400_000_000})
+             for s in range(10)]
+
+    return runs
+
+
 SUITES = {
-    "thesis":    suite_thesis,
-    "moreseeds": suite_moreseeds,
-    "pendulum":  suite_pendulum,
-    "kinetix":   suite_kinetix,
+    "thesis":      suite_thesis,
+    "moreseeds":   suite_moreseeds,
+    "pendulum":    suite_pendulum,
+    "kinetix":     suite_kinetix,
+    "mountaincar": suite_mountaincar,
 }
 
 

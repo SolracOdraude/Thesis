@@ -1,8 +1,8 @@
 """
 experiments.py
 ==============
-QEggRoll (int8 ES) training loop for the three thesis target environments:
-  gymnax  : CartPole-v1, Pendulum-v1
+QEggRoll (int8 ES) training loop for the thesis target environments:
+  gymnax  : CartPole-v1, Pendulum-v1, MountainCar-v0, MountainCarContinuous-v0
   kinetix : h1_thrust_over_ball (s)
 
 Install:
@@ -97,16 +97,24 @@ class Args:
     noise_size_exp:         Optional[int]   = None   # ablation: BIG_RAND_MATRIX size
     action_scale:           Optional[float] = None   # output scale (e.g. 2.0 for Pendulum ±2)
     max_update_step:        Optional[int]   = None   # 1=pm1, 2=capped ±2
+    update_threshold:       Optional[int]   = None   # noise gate: weight only moves if |Z| > threshold×sqrt(N/2)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Observation helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def encode_obs(obs: jnp.ndarray, scale: int) -> jnp.ndarray:
-    """Float or integer obs → int8 fixed-point."""
+def encode_obs(obs: jnp.ndarray, scale) -> jnp.ndarray:
+    """Float or integer obs → int8 fixed-point.
+
+    scale can be a scalar int or a per-dimension array/list. Using a
+    per-dimension array is essential for environments where different
+    observation dimensions have very different magnitudes (e.g. MountainCar:
+    position ∈ [-1.2, 0.6] but velocity ∈ [-0.07, 0.07]).
+    """
+    s = jnp.asarray(scale, dtype=jnp.float32)
     return jnp.clip(
-        jnp.round(obs.astype(jnp.float32) * scale).astype(jnp.int32),
+        jnp.round(obs.astype(jnp.float32) * s).astype(jnp.int32),
         -MAX, MAX,
     ).astype(jnp.int8)
 
@@ -153,7 +161,7 @@ class IntMLPContinuous(Model):
         x = call_submodule(Linear, "proj", common_params, x)
         for i in range(n_layer):
             x = call_submodule(EGG_LN, f"ln{i}", common_params, x)
-            x = jnp.clip(x, 0, MAX).astype(DTYPE)   # integer ReLU: commented out — int8 clipping is the nonlinearity
+            x = jnp.clip(x, 0, MAX).astype(DTYPE)   # integer ReLU (pqn: relu after layer norm)
             x = call_submodule(Linear, f"linear{i}", common_params, x)
         logits_int8 = call_submodule(Linear, "head", common_params, x)
         # Dequantize fixed-point int8 → float, squash to (-1, 1)
@@ -181,11 +189,22 @@ def select_action_continuous(action_mean, log_std, rng, deterministic):
 # Per-suite rollout factory functions
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ── gymnax (CartPole, Pendulum) ───────────────────────────────────────────────
+# ── Reward shaping potentials ─────────────────────────────────────────────────
+# Potential-based shaping: shaped_reward = env_reward + Φ(next_obs) − Φ(obs).
+# Preserves the optimal-policy ordering (Ng et al. 1999) while giving a dense
+SHAPING_FNS = {
+    # Add potential-based shaping here if needed for specific environments.
+    # MountainCar uses pure env rewards (-1/step) to keep the fitness
+    # landscape unmodified; the ES distinguishes goal-reaching members
+    # purely through the return difference (goal: -steps, non-goal: -200).
+}
+
+
+# ── gymnax (CartPole, Pendulum, MountainCar, …) ───────────────────────────────
 
 def make_gymnax_rollout(env, env_params, cfg,
                         frozen_noiser_params, frozen_params, es_tree_key,
-                        model_cls, log_std=None):
+                        model_cls, log_std=None, shaping_fn=None):
     obs_scale     = cfg["obs_scale"]
     deterministic = cfg["deterministic_policy"]
     action_type   = cfg["action_type"]
@@ -206,8 +225,13 @@ def make_gymnax_rollout(env, env_params, cfg,
                          * action_scale
             next_obs, next_state, reward, next_done, _ = env.step(
                 step_rng, state, action, env_params)
+            if shaping_fn is not None:
+                reward = reward + shaping_fn(next_obs) - shaping_fn(obs)
             total_return = total_return + reward * (1.0 - done.astype(jnp.float32))
-            return (next_obs, next_state, next_done, total_return, rng), None
+            # Latch done: once the episode ends it must stay ended.  Without this,
+            # gymnax's fixed-length scan can reset done to False when the car
+            # leaves the goal region, unmasking rewards for a second "episode".
+            return (next_obs, next_state, done | next_done, total_return, rng), None
 
         rng_reset, rng_ep = jax.random.split(rng_key)
         obs, state = env.reset(rng_reset, env_params)
@@ -249,7 +273,7 @@ def make_kinetix_rollout(env, env_params, cfg,
             next_obs, next_state, reward, next_done, _ = env.step(
                 step_rng, state, action, env_params)
             total_return = total_return + reward * (1.0 - done.astype(jnp.float32))
-            return (next_obs, next_state, next_done, total_return, rng), None
+            return (next_obs, next_state, done | next_done, total_return, rng), None
 
         rng_reset, rng_ep = jax.random.split(rng_key)
         obs, state = env.reset(rng_reset, env_params)
@@ -289,11 +313,17 @@ def setup_environment(cfg, key, frozen_noiser_params, frozen_params, es_tree_key
         act_dim = int(env.action_space(env_params).n) if cfg["action_type"] == "discrete" \
                   else int(np.prod(env.action_space(env_params).shape))
 
-        model_cls = IntMLP if cfg["action_type"] == "discrete" else IntMLPContinuous
+        model_cls  = IntMLP if cfg["action_type"] == "discrete" else IntMLPContinuous
+        shaping_fn = SHAPING_FNS.get(cfg.get("gymnax_name", ""))
+        # Training rollout: with reward shaping (if defined) for a dense fitness signal.
         fn = make_gymnax_rollout(env, env_params, cfg,
                                  frozen_noiser_params, frozen_params, es_tree_key,
-                                 model_cls, log_std)
-        eval_fn = lambda np_, p, rng: fn(np_, p, None, rng)
+                                 model_cls, log_std, shaping_fn=shaping_fn)
+        # Eval rollout: always uses the true env reward so logged returns are comparable.
+        eval_rollout = make_gymnax_rollout(env, env_params, cfg,
+                                           frozen_noiser_params, frozen_params, es_tree_key,
+                                           model_cls, log_std, shaping_fn=None)
+        eval_fn = lambda np_, p, rng: eval_rollout(np_, p, None, rng)
 
     elif suite == "kinetix":
         assert HAS_KINETIX, "pip install git+https://github.com/FLAIROx/Kinetix.git"
@@ -356,6 +386,7 @@ def run_experiment(args: Args):
     if args.n_parallel_evaluations is not None: cfg["n_parallel_evaluations"] = args.n_parallel_evaluations
     if args.action_scale           is not None: cfg["action_scale"]           = args.action_scale
     if args.max_update_step        is not None: cfg["max_update_step"]        = args.max_update_step
+    if args.update_threshold       is not None: cfg["update_threshold"]       = args.update_threshold
 
     suite       = cfg["suite"]
     action_type = cfg["action_type"]
@@ -425,7 +456,7 @@ def run_experiment(args: Args):
     frozen_noiser_params, noiser_params = QEggRoll.init_noiser(
         params,
         sigma_shift=cfg["sigma_shift"],
-        update_threshold=2,
+        update_threshold=cfg.get("update_threshold", 2),
         dtype="int8",
         noise_seed=args.seed,
         noise_reuse=1,

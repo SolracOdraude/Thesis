@@ -268,9 +268,9 @@ class IntMLP(Model):
         x = call_submodule(Linear, "proj", common_params, x)
         # Residual blocks
         for i in range(n_layer):
-            # TODO: pre-norm vs post-norm
             residual = x
             x = call_submodule(EGG_LN, f"ln{i}", common_params, x)
+            x = jnp.clip(x, 0, MAX).astype(DTYPE)   # integer ReLU (pqn: relu after layer norm)
             x = call_submodule(Linear, f"linear{i}", common_params, x)
             #x = clipped_add(x, residual)
         # Output head (logits)
